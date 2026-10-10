@@ -7,8 +7,9 @@ rem   build.bat [version] [selftest]
 rem
 rem   build.bat 1.2.3           -> windows\build\KeyBridge.exe
 rem   build.bat 1.2.3 selftest  -> windows\build\KeyBridge-selftest.exe
-rem                                (docs/PROTOCOL.md Appendix A.2/A.4/A.5
-rem                                conformance hooks; console app; never shipped)
+rem                                (docs/PROTOCOL.md Appendix A.2/A.4/A.5 and
+rem                                docs/UPDATES.md section 6 conformance hooks;
+rem                                console app; never shipped)
 rem
 rem version defaults to 0.0.0. A leading "v" and a "-suffix" are accepted;
 rem only MAJOR.MINOR.PATCH (each 0..65535) goes into VERSIONINFO.
@@ -66,10 +67,11 @@ if not exist "%OBJ%\" mkdir "%OBJ%" || goto :fail
 
 set "CFLAGS=/nologo /O2 /MT /W4 /sdl /GS /guard:cf /Gy /Gw /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN"
 set "LFLAGS=/NOLOGO /DYNAMICBASE /NXCOMPAT /HIGHENTROPYVA /GUARD:CF /CETCOMPAT /OPT:REF /OPT:ICF /INCREMENTAL:NO"
-set "LIBS=ws2_32.lib user32.lib shell32.lib gdi32.lib bcrypt.lib crypt32.lib comctl32.lib advapi32.lib"
-rem Protocol, pairing and discovery code shared by both builds (Appendix A:
-rem the selftest must run the same code as the app).
-set "CORE=src\kbp2.c src\pairing.c src\discovery.c src\crypto.c src\kbutil.c"
+set "LIBS=ws2_32.lib user32.lib shell32.lib gdi32.lib bcrypt.lib crypt32.lib comctl32.lib advapi32.lib winhttp.lib"
+rem Protocol, pairing, discovery and update-verification code shared by both
+rem builds (Appendix A and UPDATES.md section 6: the selftest must run the same
+rem code as the app).
+set "CORE=src\kbp2.c src\pairing.c src\discovery.c src\crypto.c src\kbutil.c src\update.c src\update_manifest.c"
 
 if /i "%MODE%"=="selftest" goto :selftest
 
@@ -85,7 +87,7 @@ echo Building KeyBridge.exe %VMAJ%.%VMIN%.%VPAT%
 rc /nologo /I src /I %OBJ% /fo %OBJ%\keybridge.res keybridge.rc || goto :fail
 
 if exist "%OUT%\KeyBridge.exe" del /q "%OUT%\KeyBridge.exe" || goto :fail
-cl %CFLAGS% /Fo%OBJ%\ /Fe%OUT%\KeyBridge.exe ^
+cl %CFLAGS% /I %OBJ% /Fo%OBJ%\ /Fe%OUT%\KeyBridge.exe ^
     src\main.c src\worker.c src\inject.c src\config.c %CORE% %OBJ%\keybridge.res ^
     /link %LFLAGS% /SUBSYSTEM:WINDOWS /MANIFEST:NO %LIBS% || goto :fail
 if not exist "%OUT%\KeyBridge.exe" goto :fail

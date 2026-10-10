@@ -117,6 +117,19 @@ For example, <kbd>⌘</kbd> opens the Start menu, and Windows shortcuts like <kb
 
 Prefer Mac-style shortcuts? Turn on **Use ⌘ Command as Ctrl on Windows** in Settings. Then <kbd>⌘</kbd> + <kbd>C</kbd> / <kbd>⌘</kbd> + <kbd>V</kbd> copy and paste on the PC, and <kbd>⌃</kbd> Control becomes the Windows key.
 
+## Updates
+
+KeyBridge keeps itself up to date (from v1.4.0 on). Both apps check GitHub for a new version 10 seconds after they start and once a day after that, and ask before installing anything.
+
+- **Mac:** click **Install Update**. The installer opens; click through it and enter your password. KeyBridge restarts on the new version.
+- **Windows:** click **Install Update**. It installs silently and restarts KeyBridge. The portable exe can't update itself, so it opens the download page instead.
+- **Check now:** **Check for Updates…** in the Mac menu or the Windows tray menu.
+- **Turn it off:** **Automatically check for updates** in the Mac's Settings, or the Windows tray menu.
+
+Updates are signed. Each release publishes a small manifest signed with a key that only the release build has. The apps refuse any update whose signature, size or SHA-256 doesn't match, even if it came from GitHub. Details: [`docs/UPDATES.md`](docs/UPDATES.md).
+
+Release builds of the Mac app are signed with KeyBridge's own long-lived certificate, so macOS keeps the Accessibility and Keychain permissions after an update. You won't have to grant them again.
+
 ## Security
 
 - **Pairing with no secret to type.** The Mac and the PC agree on a new random key with an ECDH P-256 exchange, as Bluetooth does. After that, both sides prove they hold that key before any keystroke is sent. A device that isn't paired can't receive your typing or inject keys into your PC.

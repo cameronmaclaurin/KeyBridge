@@ -80,6 +80,8 @@ final class AppSettings {
     private enum K {
         static let hotkeyKey = "hotkeyKeyCode", hotkeyMods = "hotkeyMods"
         static let swap = "swapCommandControl", sound = "playSwitchSound", notify = "showNotifications"
+        static let autoUpdate = "autoCheckForUpdates", skippedUpdate = "skippedUpdateVersion"
+        static let lastUpdateCheck = "lastUpdateCheck"
     }
 
     private init() {
@@ -89,6 +91,7 @@ final class AppSettings {
             K.swap: false,
             K.sound: false,
             K.notify: true,
+            K.autoUpdate: true,
         ])
     }
 
@@ -111,5 +114,23 @@ final class AppSettings {
     var showNotifications: Bool {
         get { d.bool(forKey: K.notify) }
         set { d.set(newValue, forKey: K.notify); onChange?() }
+    }
+
+    /// docs/UPDATES.md §2: at launch (after 10 s) and every 24 h. Default on.
+    var autoCheckUpdates: Bool {
+        get { d.bool(forKey: K.autoUpdate) }
+        set { d.set(newValue, forKey: K.autoUpdate); onChange?() }
+    }
+
+    /// "Skip This Version": not offered again by automatic checks.
+    var skippedUpdateVersion: String? {
+        get { d.string(forKey: K.skippedUpdate) }
+        set { d.set(newValue, forKey: K.skippedUpdate) }
+    }
+
+    /// Last check that got a validly signed manifest.
+    var lastUpdateCheck: Date? {
+        get { d.object(forKey: K.lastUpdateCheck) as? Date }
+        set { d.set(newValue, forKey: K.lastUpdateCheck) }
     }
 }

@@ -48,7 +48,7 @@ MinVersion=10.0
 
 ; A running KeyBridge is closed by the [Code] below before these checks run
 ; (InitializeSetup/InitializeUninstall happen before Setup/Uninstall look at
-; AppMutex). Setup passes the name to OpenMutex unchanged, so the app's
+; AppMutex, in every mode including /VERYSILENT). Setup passes the name to OpenMutex unchanged, so the app's
 ; "Local\" session-namespace mutex is found exactly as the app created it;
 ; "Global\" is not needed for a per-user install in the user's own session.
 AppMutex={#AppMutexName}
@@ -89,6 +89,10 @@ Root: HKCU; Subkey: "Software\{#AppName}"; ValueType: dword; ValueName: "StartAt
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+; In-app updates run "Setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /RELAUNCH"
+; (docs/UPDATES.md). Not a postinstall entry and no skipifsilent, so it also
+; runs in silent mode; it runs only when /RELAUNCH was passed.
+Filename: "{app}\{#AppExeName}"; Flags: nowait skipifdoesntexist; Check: RelaunchRequested
 
 [UninstallDelete]
 ; Settings: Mac address and name, and the DPAPI-encrypted pairing key.
@@ -98,21 +102,46 @@ Type: filesandordirs; Name: "{userappdata}\{#AppName}"
 const
   KB_WM_CLOSE = $0010;
 
+{ /RELAUNCH on the command line (case-insensitive): an in-app update asked
+  for KeyBridge to be started again afterwards. }
+function RelaunchRequested(): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 1 to ParamCount do
+    if CompareText(ParamStr(I), '/RELAUNCH') = 0 then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
 { Ask a running KeyBridge to quit (it releases any held keys first) and wait
-  briefly for it to go away. }
+  up to 10 s for its mutex to go away. This waits on the mutex even when the
+  window is already gone: after an in-app update KeyBridge is exiting on its
+  own, and with /VERYSILENT /SUPPRESSMSGBOXES Setup would abort, rather than
+  ask, if its AppMutex check still found it running. }
 procedure CloseRunningKeyBridge();
 var
   Wnd: HWND;
+  Asked: Boolean;
   I: Integer;
 begin
-  Wnd := FindWindowByClassName('{#AppWindowClass}');
-  if Wnd = 0 then
-    Exit;
-  PostMessage(Wnd, KB_WM_CLOSE, 0, 0);
-  for I := 1 to 50 do
+  Asked := False;
+  for I := 1 to 100 do
   begin
     if not CheckForMutexes('{#AppMutexName}') then
       Exit;
+    if not Asked then
+    begin
+      Wnd := FindWindowByClassName('{#AppWindowClass}');
+      if Wnd <> 0 then
+      begin
+        PostMessage(Wnd, KB_WM_CLOSE, 0, 0);
+        Asked := True;
+      end;
+    end;
     Sleep(100);
   end;
 end;

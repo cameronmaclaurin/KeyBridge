@@ -1,5 +1,6 @@
 /*
- * KeyBridge - conformance selftest (docs/PROTOCOL.md Appendix A.2, A.4, A.5).
+ * KeyBridge - conformance selftest (docs/PROTOCOL.md Appendix A.2, A.4, A.5;
+ * docs/UPDATES.md section 6).
  *
  * Built only by "build.bat <version> selftest" as KeyBridge-selftest.exe.
  * Uses the same KBP2 handshake/record code (kbp2.c), pairing code
@@ -13,6 +14,10 @@
  *       0 PAIRED or CANCELLED, 2 PAIR FAILED.
  *   --selftest-discover    [--timeout <seconds, default 5>]             (A.5)
  *       0 done browsing, 3 DNS-SD APIs not available, 1 browse failed.
+ *   --selftest-verify-update <manifest-file> <sig-file> --current X.Y.Z [--pubkey <130 hex>]
+ *       (UPDATES.md 6) one line: "UPDATE <version> <windows-url> <sha256> <size>"
+ *       or "CURRENT" (exit 0), or "INVALID" (exit 2). Uses update.c's
+ *       kb_upd_evaluate, exactly as the app does.
  *   64 bad command line, in every mode.
  */
 #ifndef KEYBRIDGE_SELFTEST
@@ -30,12 +35,14 @@
 #include "kbp2.h"
 #include "pairing.h"
 #include "discovery.h"
+#include "update.h"
 
 #define EXIT_OK          0
 #define EXIT_ERROR       1
 #define EXIT_HANDSHAKE   2
 #define EXIT_PAIR_FAILED 2
 #define EXIT_NO_DNSSD    3
+#define EXIT_INVALID     2
 #define EXIT_USAGE       64
 
 #define DISCOVER_DEFAULT_S 5
@@ -55,7 +62,9 @@ static int usage(void)
     fputs("usage: KeyBridge-selftest.exe --selftest-client --host <H> --port <P> --psk <64 hex chars>\n"
           "       KeyBridge-selftest.exe --selftest-pair-client --host <H> --port <P> --name <NAME>"
           " [--confirm yes|no]\n"
-          "       KeyBridge-selftest.exe --selftest-discover [--timeout <seconds>]\n",
+          "       KeyBridge-selftest.exe --selftest-discover [--timeout <seconds>]\n"
+          "       KeyBridge-selftest.exe --selftest-verify-update <manifest-file> <sig-file>"
+          " --current <X.Y.Z> [--pubkey <130 hex chars>]\n",
           stderr);
     return EXIT_USAGE;
 }
@@ -422,15 +431,108 @@ static int run_discover(unsigned long timeout_s)
 }
 
 /* ------------------------------------------------------------------------ */
+/* UPDATES.md section 6: manifest verification                              */
+/* ------------------------------------------------------------------------ */
+
+/* Read at most cap bytes. 1 = ok, 0 = larger than cap, -1 = can't read. */
+static int read_small_file(const wchar_t *path, uint8_t *buf, DWORD cap, size_t *len)
+{
+    HANDLE f;
+    DWORD got = 0, n;
+    int rc = 1;
+
+    *len = 0;
+    f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE)
+        return -1;
+    for (;;) {
+        BYTE extra;
+        if (got == cap) {
+            /* Full: one more byte means the file is too large. */
+            n = 0;
+            if (!ReadFile(f, &extra, 1, &n, NULL))
+                rc = -1;
+            else if (n != 0)
+                rc = 0;
+            break;
+        }
+        n = 0;
+        if (!ReadFile(f, buf + got, cap - got, &n, NULL)) {
+            rc = -1;
+            break;
+        }
+        if (n == 0)
+            break;
+        got += n;
+    }
+    CloseHandle(f);
+    *len = got;
+    return rc;
+}
+
+static int run_verify_update(const wchar_t *manifest_path, const wchar_t *sig_path,
+                             const char *current, const uint8_t *pubkey)
+{
+    static uint8_t manifest[KB_UPD_META_MAX];
+    static uint8_t sig[KB_UPD_META_MAX];
+    static kb_update_manifest m;
+    static char line[32 + KB_UPD_VERSION_MAX + KB_UPD_URL_MAX + KB_UPD_SHA256_HEX];
+    size_t mlen = 0, slen = 0;
+    int mrc, src;
+
+    mrc = read_small_file(manifest_path, manifest, (DWORD)sizeof(manifest), &mlen);
+    src = read_small_file(sig_path, sig, (DWORD)sizeof(sig), &slen);
+    if (mrc < 0 || src < 0)
+        fputs("error: could not read the manifest or signature file\n", stderr);
+    else if (mrc == 0 || src == 0)
+        fputs("error: manifest or signature is larger than 16 KB\n", stderr);
+
+    if (mrc == 1 && src == 1) {
+        switch (kb_upd_evaluate(manifest, mlen, sig, slen, pubkey, current, &m)) {
+        case KB_UPD_V_NEWER:
+            (void)snprintf(line, sizeof(line), "UPDATE %s %s %s %lu", m.version, m.windows_url,
+                           m.windows_sha256, (unsigned long)m.windows_size);
+            out_line(line);
+            return EXIT_OK;
+        case KB_UPD_V_CURRENT:
+            out_line("CURRENT");
+            return EXIT_OK;
+        case KB_UPD_V_INVALID:
+        default:
+            break;
+        }
+    }
+    out_line("INVALID");
+    return EXIT_INVALID;
+}
+
+/* ASCII-only copy of a command-line argument. */
+static int narrow_arg(const wchar_t *in, char *out, size_t cap)
+{
+    size_t i;
+    for (i = 0; in[i] != 0; i++) {
+        if (i + 1 >= cap || in[i] >= 0x80)
+            return 0;
+        out[i] = (char)in[i];
+    }
+    out[i] = 0;
+    return 1;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Command line                                                             */
 /* ------------------------------------------------------------------------ */
 
-enum { MODE_NONE, MODE_CLIENT, MODE_PAIR_CLIENT, MODE_DISCOVER };
+enum { MODE_NONE, MODE_CLIENT, MODE_PAIR_CLIENT, MODE_DISCOVER, MODE_VERIFY_UPDATE };
 
 int wmain(int argc, wchar_t **argv)
 {
     const wchar_t *host = NULL, *port = NULL, *psk_arg = NULL, *name = NULL;
     const wchar_t *confirm = NULL, *timeout = NULL;
+    const wchar_t *current = NULL, *pubkey_arg = NULL, *manifest_path = NULL, *sig_path = NULL;
+    char current8[KB_UPD_VERSION_MAX + 1], pubkey8[2 * KB_UPD_PUBKEY_LEN + 1];
+    uint8_t pubkey[KB_UPD_PUBKEY_LEN];
     uint8_t psk[KBP2_PSK_LEN];
     unsigned long timeout_s = DISCOVER_DEFAULT_S;
     int mode = MODE_NONE, i;
@@ -448,6 +550,12 @@ int wmain(int argc, wchar_t **argv)
             new_mode = MODE_PAIR_CLIENT;
         else if (wcscmp(a, L"--selftest-discover") == 0)
             new_mode = MODE_DISCOVER;
+        else if (wcscmp(a, L"--selftest-verify-update") == 0)
+            new_mode = MODE_VERIFY_UPDATE;
+        else if (wcscmp(a, L"--current") == 0)
+            slot = &current;
+        else if (wcscmp(a, L"--pubkey") == 0)
+            slot = &pubkey_arg;
         else if (wcscmp(a, L"--host") == 0)
             slot = &host;
         else if (wcscmp(a, L"--port") == 0)
@@ -467,6 +575,12 @@ int wmain(int argc, wchar_t **argv)
             if (mode != MODE_NONE)
                 return usage();
             mode = new_mode;
+            if (mode == MODE_VERIFY_UPDATE) { /* two positional file names follow */
+                if (i + 2 >= argc)
+                    return usage();
+                manifest_path = argv[++i];
+                sig_path = argv[++i];
+            }
         } else {
             if (*slot != NULL || i + 1 >= argc)
                 return usage();
@@ -474,7 +588,29 @@ int wmain(int argc, wchar_t **argv)
         }
     }
 
+    if (mode != MODE_VERIFY_UPDATE && (current != NULL || pubkey_arg != NULL))
+        return usage();
+
     switch (mode) {
+    case MODE_VERIFY_UPDATE:
+        if (current == NULL || host != NULL || port != NULL || psk_arg != NULL || name != NULL ||
+            confirm != NULL || timeout != NULL)
+            return usage();
+        if (!narrow_arg(current, current8, sizeof(current8)) ||
+            !kb_upd_version_valid(current8, strlen(current8))) {
+            fputs("error: --current must be MAJOR.MINOR.PATCH\n", stderr);
+            return EXIT_USAGE;
+        }
+        if (pubkey_arg != NULL &&
+            (!narrow_arg(pubkey_arg, pubkey8, sizeof(pubkey8)) ||
+             !kb_upd_hex_decode(pubkey8, strlen(pubkey8), pubkey, sizeof(pubkey)) ||
+             !kb_p256_point_valid(pubkey))) {
+            fputs("error: --pubkey must be 130 hex characters (an uncompressed P-256 point)\n", stderr);
+            return EXIT_USAGE;
+        }
+        return run_verify_update(manifest_path, sig_path, current8,
+                                 pubkey_arg != NULL ? pubkey : NULL);
+
     case MODE_CLIENT:
         if (host == NULL || port == NULL || psk_arg == NULL || name != NULL || confirm != NULL ||
             timeout != NULL || !valid_port(port))

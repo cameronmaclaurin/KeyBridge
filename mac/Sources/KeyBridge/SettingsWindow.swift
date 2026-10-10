@@ -27,6 +27,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let soundBox = NSButton(checkboxWithTitle: "Play a sound when switching", target: nil, action: nil)
     private let notifyBox = NSButton(checkboxWithTitle: "Show notifications", target: nil, action: nil)
     private let loginBox = NSButton(checkboxWithTitle: "Launch KeyBridge at login", target: nil, action: nil)
+    private let updateBox = NSButton(checkboxWithTitle: "Automatically check for updates", target: nil, action: nil)
+    private let lastChecked = NSTextField(labelWithString: "")
     private let pcName = NSTextField(labelWithString: "")
     private let pcStatus = NSTextField(labelWithString: "")
     private let pcButton = NSButton(title: "", target: nil, action: nil)
@@ -72,11 +74,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         hotkeyHint.textColor = .secondaryLabelColor
         pcStatus.textColor = .secondaryLabelColor
         pcName.font = .systemFont(ofSize: 13, weight: .medium)
+        lastChecked.font = .systemFont(ofSize: 11)
+        lastChecked.textColor = .secondaryLabelColor
 
         for (b, sel) in [(recordButton, #selector(recordTapped)), (resetButton, #selector(resetTapped)),
                          (swapBox, #selector(swapChanged)), (soundBox, #selector(soundChanged)),
                          (notifyBox, #selector(notifyChanged)), (loginBox, #selector(loginChanged)),
-                         (pcButton, #selector(pcButtonTapped))] {
+                         (pcButton, #selector(pcButtonTapped)), (updateBox, #selector(updateChanged))] {
             b.target = self
             b.action = sel
         }
@@ -92,12 +96,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let keyboardCol = column([swapBox, swapHelp])
         let feedbackCol = column([soundBox, notifyBox, loginBox])
         let pcCol = column([pcName, pcStatus, pcButton])
+        let updateCol = column([updateBox, lastChecked])
 
         let grid = NSGridView(views: [
             [label("Switch shortcut:"), hotkeyCol],
             [label("Keyboard:"), keyboardCol],
             [label("General:"), feedbackCol],
             [label("Windows PC:"), pcCol],
+            [label("Updates:"), updateCol],
         ])
         grid.rowSpacing = 18
         grid.columnSpacing = 12
@@ -142,6 +148,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     // MARK: – State
 
+    private static let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        f.doesRelativeDateFormatting = true
+        return f
+    }()
+
     @objc func refresh() {
         if !recording {
             hotkeyField.stringValue = settings.hotkey.displayString
@@ -153,6 +167,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         soundBox.state = settings.playSwitchSound ? .on : .off
         notifyBox.state = settings.showNotifications ? .on : .off
         loginBox.state = host?.settingsLaunchAtLoginState ?? .off
+        updateBox.state = settings.autoCheckUpdates ? .on : .off
+        lastChecked.stringValue = "Last checked: " + (settings.lastUpdateCheck.map { Self.dateFormatter.string(from: $0) } ?? "Never")
 
         if let name = host?.settingsPairedName {
             pcName.stringValue = name
@@ -201,6 +217,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     @objc private func swapChanged() { settings.swapCommandControl = swapBox.state == .on }
     @objc private func soundChanged() { settings.playSwitchSound = soundBox.state == .on }
     @objc private func notifyChanged() { settings.showNotifications = notifyBox.state == .on }
+    @objc private func updateChanged() { settings.autoCheckUpdates = updateBox.state == .on }
     @objc private func loginChanged() { host?.settingsToggleLaunchAtLogin(); refresh() }
 
     @objc private func pcButtonTapped() {

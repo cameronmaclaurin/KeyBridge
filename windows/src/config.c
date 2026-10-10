@@ -19,6 +19,10 @@
 #define KB_RUN_VALUE      L"KeyBridge"
 #define KB_APP_KEY        L"Software\\KeyBridge"
 #define KB_PREF_AUTOSTART L"StartAtSignIn"
+#define KB_PREF_AUTO_UPDATE L"AutoUpdate"
+#define KB_PREF_SKIPPED   L"SkippedVersion"
+#define KB_PREF_LAST_CHECK L"LastUpdateCheck"
+#define KB_VERSION_CHARS  32
 #define KB_CONFIG_FILE    L"config.bin"
 #define KB_CONFIG_TMP     L"config.bin.tmp"
 #define KB_CONFIG_MAX     65536
@@ -281,4 +285,84 @@ BOOL autostart_default(void)
                      NULL, &v, &cb) == ERROR_SUCCESS)
         return v != 0;
     return TRUE;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Update preferences (HKCU\Software\KeyBridge)                             */
+/* ------------------------------------------------------------------------ */
+
+static BOOL pref_set(const wchar_t *name, DWORD type, const void *data, DWORD cb)
+{
+    HKEY key = NULL;
+    LSTATUS r = RegCreateKeyExW(HKEY_CURRENT_USER, KB_APP_KEY, 0, NULL, 0, KEY_SET_VALUE, NULL,
+                                &key, NULL);
+    if (r != ERROR_SUCCESS)
+        return FALSE;
+    r = RegSetValueExW(key, name, 0, type, (const BYTE *)data, cb);
+    RegCloseKey(key);
+    return r == ERROR_SUCCESS;
+}
+
+BOOL prefs_auto_update(void)
+{
+    DWORD v = 1, cb = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, KB_APP_KEY, KB_PREF_AUTO_UPDATE, RRF_RT_REG_DWORD,
+                     NULL, &v, &cb) == ERROR_SUCCESS)
+        return v != 0;
+    return TRUE;
+}
+
+BOOL prefs_set_auto_update(BOOL enable)
+{
+    DWORD v = enable ? 1u : 0u;
+    return pref_set(KB_PREF_AUTO_UPDATE, REG_DWORD, &v, (DWORD)sizeof(v));
+}
+
+/* An ASCII version string as UTF-16. FALSE if it is empty or too long. */
+static BOOL version_to_wide(const char *version, wchar_t out[KB_VERSION_CHARS + 1])
+{
+    size_t i;
+    for (i = 0; version[i] != 0; i++) {
+        if (i >= KB_VERSION_CHARS || (unsigned char)version[i] >= 0x80)
+            return FALSE;
+        out[i] = (wchar_t)version[i];
+    }
+    out[i] = 0;
+    return i > 0;
+}
+
+BOOL prefs_is_skipped_version(const char *version)
+{
+    wchar_t want[KB_VERSION_CHARS + 1], have[KB_VERSION_CHARS + 1];
+    DWORD cb = sizeof(have);
+
+    if (!version_to_wide(version, want))
+        return FALSE;
+    if (RegGetValueW(HKEY_CURRENT_USER, KB_APP_KEY, KB_PREF_SKIPPED, RRF_RT_REG_SZ, NULL,
+                     have, &cb) != ERROR_SUCCESS)
+        return FALSE;
+    return wcscmp(want, have) == 0;
+}
+
+BOOL prefs_set_skipped_version(const char *version)
+{
+    wchar_t v[KB_VERSION_CHARS + 1];
+    if (!version_to_wide(version, v))
+        return FALSE;
+    return pref_set(KB_PREF_SKIPPED, REG_SZ, v, (DWORD)((wcslen(v) + 1) * sizeof(wchar_t)));
+}
+
+ULONGLONG prefs_last_update_check(void)
+{
+    ULONGLONG v = 0;
+    DWORD cb = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, KB_APP_KEY, KB_PREF_LAST_CHECK, RRF_RT_REG_QWORD,
+                     NULL, &v, &cb) != ERROR_SUCCESS)
+        return 0;
+    return v;
+}
+
+BOOL prefs_set_last_update_check(ULONGLONG unix_seconds)
+{
+    return pref_set(KB_PREF_LAST_CHECK, REG_QWORD, &unix_seconds, (DWORD)sizeof(unix_seconds));
 }

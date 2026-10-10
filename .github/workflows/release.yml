@@ -64,6 +64,8 @@ jobs:
       MAC_NOTARY_PASSWORD: ${{ secrets.MAC_NOTARY_PASSWORD }}
       WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
       WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+      MAC_SELF_SIGNED_P12_BASE64: ${{ secrets.MAC_SELF_SIGNED_P12_BASE64 }}
+      MAC_SELF_SIGNED_P12_PASSWORD: ${{ secrets.MAC_SELF_SIGNED_P12_PASSWORD }}
 
   release:
     name: Publish GitHub release
@@ -81,7 +83,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          sparse-checkout: .github
+          sparse-checkout: |
+            .github
+            tools
 
       - name: Download macOS packages
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -105,6 +109,31 @@ jobs:
           sha256sum "${files[@]}" > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Create and sign the update manifest (docs/UPDATES.md)
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+          KEYBRIDGE_UPDATE_SIGNING_KEY: ${{ secrets.KEYBRIDGE_UPDATE_SIGNING_KEY }}
+        run: |
+          if [ "$PRERELEASE" = "true" ]; then
+            echo "Pre-release: apps only update to full releases; writing the manifest anyway for testing."
+          fi
+          if [ -z "$KEYBRIDGE_UPDATE_SIGNING_KEY" ]; then
+            echo "::error::Secret KEYBRIDGE_UPDATE_SIGNING_KEY is not set, so installed apps could not verify this release. See docs/UPDATES.md."
+            exit 1
+          fi
+          python -m pip install --disable-pip-version-check "cryptography==$(sed -n 's/^cryptography==//p' tools/requirements.txt)"
+          python tools/update_manifest.py generate --version "${VERSION%%-*}" \
+            --mac assets/KeyBridge-macOS.pkg --windows assets/KeyBridge-Windows-Setup.exe \
+            --out assets/update-manifest.txt
+          python tools/update_manifest.py sign --in assets/update-manifest.txt --out assets/update-manifest.sig
+          python tools/update_manifest.py verify --in assets/update-manifest.txt --sig assets/update-manifest.sig
+          cat assets/update-manifest.txt
+
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -114,6 +143,7 @@ jobs:
             assets/KeyBridge-Windows-Setup.exe
             assets/KeyBridge-Windows-Portable.exe
             assets/SHA256SUMS.txt
+            assets/update-manifest.txt
 
       - name: Render release notes
         env:
@@ -134,3 +164,5 @@ jobs:
             assets/KeyBridge-Windows-Setup.exe
             assets/KeyBridge-Windows-Portable.exe
             assets/SHA256SUMS.txt
+            assets/update-manifest.txt
+            assets/update-manifest.sig

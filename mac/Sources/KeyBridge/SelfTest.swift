@@ -110,6 +110,44 @@ enum SelfTest {
         dispatchMain()
     }
 
+    // MARK: docs/UPDATES.md §6
+
+    /// `KeyBridge --selftest-verify-update <manifest-file> <sig-file> --current <X.Y.Z> [--pubkey <130 hex>]`
+    /// Prints `UPDATE <version> <mac-url> <mac-sha256> <mac-size>` or `CURRENT` (exit 0), or
+    /// `INVALID` (exit 2). Same verification, parsing and comparison code as the app.
+    static func runVerifyUpdate(_ args: [String]) -> Never {
+        let usageText = "KeyBridge --selftest-verify-update <manifest-file> <sig-file> --current <X.Y.Z> [--pubkey <130 hex>]"
+        guard let i = args.firstIndex(of: "--selftest-verify-update"), i + 2 < args.count,
+              let currentArg = value(args, "--current"), let current = UpdateVersion(currentArg)
+        else { usage(usageText) }
+        let keyHex = value(args, "--pubkey") ?? UpdateVerifier.embeddedPublicKeyHex
+        guard keyHex.utf8.count == 130, let key = UpdateVerifier.publicKey(hex: keyHex) else { usage(usageText) }
+
+        func read(_ path: String) -> Data {
+            guard let h = FileHandle(forReadingAtPath: path) else {
+                FileHandle.standardError.write(Data("can't read \(path)\n".utf8))
+                exit(1)
+            }
+            // One byte over the limit is enough to reject an oversized file.
+            let d = h.readData(ofLength: Int(UpdateVerifier.maxResponseBytes) + 1)
+            try? h.close()
+            return d
+        }
+        let manifest = read(args[i + 1]), sig = read(args[i + 2])
+
+        guard let m = UpdateVerifier.verifyAndParse(manifest: manifest, signature: sig, publicKey: key) else {
+            say("INVALID")
+            exit(2)
+        }
+        switch UpdateVerifier.decide(m, running: current) {
+        case .update(let m):
+            say("UPDATE \(m.version) \(m.mac.url.absoluteString) \(m.mac.sha256) \(m.mac.size)")
+        case .current:
+            say("CURRENT")
+        }
+        exit(0)
+    }
+
     // MARK: A.3
 
     /// `KeyBridge --selftest-pair-server --port <P> --name <NAME> [--confirm yes|no]`

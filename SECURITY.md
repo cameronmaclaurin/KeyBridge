@@ -63,6 +63,12 @@ Do this if you've given away, sold or lost a paired PC, or if you think a pairin
 - **Forget:** on the Mac, click KeyBridge in the menu bar and choose **Forget This PC…**. On the PC, choose **Forget** in the KeyBridge setup window. Forgetting on either side deletes that side's key, and the two can't connect again until you pair them.
 - **Re-pair:** pairing again replaces the old key on both computers. The Mac pairs with one PC at a time, so pairing a new PC also cuts off the old one, and any current session is dropped.
 
+## Automatic updates
+
+- The apps install an update only if `update-manifest.txt` carries a valid ECDSA P-256 signature from KeyBridge's update key, the version is newer than the one running (so no downgrades), every download URL points at this repository's releases, and the downloaded installer matches the signed size and SHA-256. HTTPS alone isn't trusted: a stolen GitHub token could swap release files, but it can't sign them.
+- The private update key exists only as the GitHub Actions secret `KEYBRIDGE_UPDATE_SIGNING_KEY` and in an offline backup. If it ever leaks, it gets rotated and a release ships with the new public key. Installs older than that release then need one manual update.
+- Mac release builds are signed with a self-signed KeyBridge certificate. It doesn't make Gatekeeper trust the app; the first launch still needs **Open Anyway**. It does keep the app's code identity stable, so macOS permissions survive updates.
+
 ## Verifying a download
 
 Each release includes `SHA256SUMS.txt`, and GitHub keeps a signed build-provenance attestation for every file. The attestation proves the file was built from this repository by GitHub Actions.

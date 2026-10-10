@@ -42,7 +42,13 @@ fi
 
 if [[ -n "${MAC_SIGN_IDENTITY:-}" ]]; then
     echo "==> Signing with identity: $MAC_SIGN_IDENTITY"
-    codesign --force --options runtime --timestamp --sign "$MAC_SIGN_IDENTITY" "$APP"
+    # MAC_SIGN_NO_TIMESTAMP=1 for KeyBridge's self-signed certificate (Apple's timestamp
+    # service only serves Apple-issued certificates).
+    if [[ "${MAC_SIGN_NO_TIMESTAMP:-}" == "1" ]]; then
+        codesign --force --options runtime --timestamp=none --sign "$MAC_SIGN_IDENTITY" "$APP"
+    else
+        codesign --force --options runtime --timestamp --sign "$MAC_SIGN_IDENTITY" "$APP"
+    fi
 else
     # Ad-hoc: macOS still ties the Accessibility grant to this signature.
     echo "==> Signing ad-hoc (set MAC_SIGN_IDENTITY to use a real identity)"

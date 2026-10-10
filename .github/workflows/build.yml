@@ -34,6 +34,10 @@ on:
         required: false
       WINDOWS_CERT_PASSWORD:
         required: false
+      MAC_SELF_SIGNED_P12_BASE64:
+        required: false
+      MAC_SELF_SIGNED_P12_PASSWORD:
+        required: false
 
 permissions:
   contents: read
@@ -62,6 +66,14 @@ jobs:
       - name: Reference client <-> reference server
         run: python tests/interop/test_reference_selfcheck.py
 
+      - name: Both apps embed the update public key from tools/update_pubkey.txt
+        run: |
+          key="$(tr -d '[:space:]' < tools/update_pubkey.txt)"
+          for dir in mac/Sources windows/src; do
+            grep -rqi "$key" "$dir" || { echo "::error::$dir does not embed the key in tools/update_pubkey.txt"; exit 1; }
+          done
+          echo "update key OK: $key"
+
   # ── macOS: selftest build, interop test, app, dmg + pkg ──────────────────
   mac:
     name: macOS build, interop test, package
@@ -73,6 +85,7 @@ jobs:
     env:
       KEYBRIDGE_VERSION: ${{ inputs.version }}
       HAVE_MAC_CERT: ${{ secrets.MAC_CERT_P12_BASE64 != '' }}
+      HAVE_MAC_SELF_SIGNED: ${{ secrets.MAC_SELF_SIGNED_P12_BASE64 != '' }}
       HAVE_MAC_NOTARY: ${{ secrets.MAC_NOTARY_APPLE_ID != '' && secrets.MAC_NOTARY_TEAM_ID != '' && secrets.MAC_NOTARY_PASSWORD != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -92,6 +105,45 @@ jobs:
 
       - name: Interop test (reference client vs Mac selftest server)
         run: python tests/interop/test_mac_server.py mac/.build/debug/KeyBridge
+
+      - name: Update verification test (Mac)
+        run: python tests/interop/test_update_verify.py mac/.build/debug/KeyBridge --platform mac
+
+      # Without a Developer ID, sign with KeyBridge's own long-lived certificate so the
+      # designated requirement stays the same across releases: macOS then keeps the
+      # Accessibility and Keychain permissions after an update.
+      - name: Import KeyBridge self-signed certificate
+        if: env.HAVE_MAC_CERT != 'true' && env.HAVE_MAC_SELF_SIGNED == 'true'
+        env:
+          MAC_SELF_SIGNED_P12_BASE64: ${{ secrets.MAC_SELF_SIGNED_P12_BASE64 }}
+          MAC_SELF_SIGNED_P12_PASSWORD: ${{ secrets.MAC_SELF_SIGNED_P12_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/keybridge-selfsigned.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+          echo "::add-mask::$keychain_password"
+          security create-keychain -p "$keychain_password" "$keychain"
+          echo "KEYCHAIN_PATH=$keychain" >> "$GITHUB_ENV"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          p12="$RUNNER_TEMP/keybridge-selfsigned.p12"
+          printf '%s' "$MAC_SELF_SIGNED_P12_BASE64" | base64 --decode > "$p12"
+          security import "$p12" -k "$keychain" -f pkcs12 -P "$MAC_SELF_SIGNED_P12_PASSWORD" -T /usr/bin/codesign
+          rm -f "$p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" > /dev/null
+          existing=()
+          while IFS= read -r kc; do
+            kc="${kc#"${kc%%[![:space:]]*}"}"; kc="${kc#\"}"; kc="${kc%\"}"
+            [ -n "$kc" ] && existing+=("$kc")
+          done < <(security list-keychains -d user)
+          security list-keychains -d user -s "$keychain" "${existing[@]}"
+          # codesign only uses trusted identities; trust this one for code signing on this runner.
+          cert="$RUNNER_TEMP/keybridge-selfsigned.pem"
+          security find-certificate -c "KeyBridge Self-Signed" -p "$keychain" > "$cert"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$cert"
+          sha1="$(openssl x509 -in "$cert" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d :)"
+          security find-identity -v -p codesigning "$keychain"
+          echo "MAC_SIGN_IDENTITY=$sha1" >> "$GITHUB_ENV"
+          echo "MAC_SIGN_NO_TIMESTAMP=1" >> "$GITHUB_ENV"
 
       - name: Import signing certificates into a temporary keychain
         if: env.HAVE_MAC_CERT == 'true'
@@ -155,6 +207,9 @@ jobs:
 
       - name: Check the shipping app has no selftest hooks
         run: python tests/check_no_selftest.py mac/build/KeyBridge.app/Contents/MacOS/KeyBridge
+
+      - name: Show the app's signature
+        run: codesign -dvv --requirements - mac/build/KeyBridge.app 2>&1 | grep -E "Authority|Identifier|TeamIdentifier|designated|Signature"
 
       - name: Package dmg and pkg
         run: mac/package.sh
@@ -245,6 +300,10 @@ jobs:
       - name: Interop test (Windows selftest client vs reference server)
         shell: pwsh
         run: python tests\interop\test_windows_client.py windows\build\KeyBridge-selftest.exe
+
+      - name: Update verification test (Windows)
+        shell: pwsh
+        run: python tests\interop\test_update_verify.py windows\build\KeyBridge-selftest.exe --platform windows
 
       # python-zeroconf advertises a _keybridge._tcp instance; the selftest build
       # must find it (PROTOCOL.md 1a, A.5). Retries once; reports SKIPPED with a

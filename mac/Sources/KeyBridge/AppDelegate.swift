@@ -24,6 +24,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Settin
     private var pairingExpiryTimer: Timer?
     private var nameWatcher: SystemNameWatcher?
     private var settingsWindow: SettingsWindowController?
+    private let updater = UpdateController()
     private let settings = AppSettings.shared
 
     private var modeLine: NSMenuItem!
@@ -65,6 +66,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Settin
         if psk == nil { showPairingWindow() }
         // `open KeyBridge.app --args -KBShowSettings YES` (handy for screenshots and support).
         if UserDefaults.standard.bool(forKey: "KBShowSettings") { showSettings() }
+        updater.start()
     }
 
     /// Opening the app again (Finder, Launchpad, `open`) while it runs: a menu-bar app would
@@ -464,6 +466,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Settin
         settingsItem.keyEquivalent = ","
         menu.addItem(settingsItem)
 
+        menu.addItem(item("Check for Updates…", #selector(checkForUpdates)))
         menu.addItem(item("About KeyBridge", #selector(showAbout)))
         let quit = NSMenuItem(title: "Quit KeyBridge", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quit)
@@ -524,6 +527,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Settin
     }
 
     @objc private func onToggle() { toggle() }
+    @objc private func checkForUpdates() { updater.checkNow() }
 
     @objc private func showAbout() {
         activate()
@@ -588,6 +592,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Settin
         }
         capture.hotkey = settings.hotkey
         capture.swapCommandControl = settings.swapCommandControl
+        updater.applySchedule()
         updateUI()
     }
 

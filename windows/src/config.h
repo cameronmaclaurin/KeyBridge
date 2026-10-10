@@ -4,6 +4,8 @@
  *                                   32-byte long-term key from pairing,
  *                                   encrypted with DPAPI (current user).
  *   HKCU\...\CurrentVersion\Run    : "KeyBridge" = "<quoted exe path>".
+ *   HKCU\Software\KeyBridge         : StartAtSignIn (installer), AutoUpdate,
+ *                                   SkippedVersion, LastUpdateCheck.
  */
 #ifndef KB_CONFIG_H
 #define KB_CONFIG_H
@@ -32,5 +34,16 @@ BOOL autostart_set(BOOL enable);
 /* First-run default for "Start KeyBridge when I sign in": the installer's
  * choice if it recorded one, otherwise TRUE. */
 BOOL autostart_default(void);
+
+/* "Automatically Check for Updates": AutoUpdate DWORD, default on. */
+BOOL prefs_auto_update(void);
+BOOL prefs_set_auto_update(BOOL enable);
+/* "Skip This Version": SkippedVersion string (an X.Y.Z version). */
+BOOL prefs_is_skipped_version(const char *version);
+BOOL prefs_set_skipped_version(const char *version);
+/* When the last update check succeeded: LastUpdateCheck QWORD, seconds since
+ * 1970 (UTC); 0 if never. */
+ULONGLONG prefs_last_update_check(void);
+BOOL prefs_set_last_update_check(ULONGLONG unix_seconds);
 
 #endif
