@@ -1,8 +1,17 @@
 # KeyBridge ⌨️🌉
 
-> Use your Mac keyboard to type on your Windows PC — no extra hardware needed.
+> Use your Mac keyboard to type on your Windows PC — no extra hardware, sub-millisecond relay latency.
 
-KeyBridge is a tiny two-part app: a Mac menu-bar app that captures your keystrokes and a Windows client that injects them. Press a hotkey to toggle which machine receives your typing.
+KeyBridge is a native two-part app: a Swift menu-bar app on your Mac that captures keystrokes and a C client on Windows that injects them. Press a hotkey to flip between which machine receives your typing.
+
+## Downloads
+
+Go to [**Releases**](../../releases) and grab the latest:
+
+| File | Platform |
+|------|----------|
+| `KeyBridge-mac.zip` | macOS 13+ |
+| `keybridge.exe` | Windows 10/11 (64-bit) |
 
 ---
 
@@ -10,12 +19,12 @@ KeyBridge is a tiny two-part app: a Mac menu-bar app that captures your keystrok
 
 ```
   [Mac keyboard]
-       │
-  keybridge_mac.py   ──── TCP over LAN ────►  keybridge_windows.py
-  (menu bar app)                               (Windows background app)
+        │ CGEventTap
+  KeyBridge.app  ── TCP · TCP_NODELAY · binary frames ──►  keybridge.exe
+  (menu bar)                                                (system tray)
 ```
 
-Both machines must be on the same network (Wi-Fi or Ethernet). The Mac acts as the server; Windows connects to it.
+Both machines must be on the same network. Mac is the server (port 9876); Windows connects to it. The binary frame protocol is 4 bytes per key event — no JSON, no parsing overhead.
 
 ---
 
@@ -23,28 +32,21 @@ Both machines must be on the same network (Wi-Fi or Ethernet). The Mac acts as t
 
 ### Mac
 
-```bash
-pip install -r requirements_mac.txt
-python keybridge_mac.py
-```
-
-> **Accessibility permission required.**  
-> macOS will prompt you to grant Accessibility access so KeyBridge can capture global keystrokes. Go to **System Settings → Privacy & Security → Accessibility** and enable it for your terminal / Python.
-
-A ⌨️ icon appears in your menu bar. Your Mac starts as the server on port **9876**.
-
----
+1. Unzip `KeyBridge-mac.zip` and move `KeyBridge.app` to `/Applications`.
+2. Double-click it — a **⌨️** appears in your menu bar.
+3. Grant **Accessibility** permission when macOS prompts you  
+   *(System Settings → Privacy & Security → Accessibility → enable KeyBridge)*.
 
 ### Windows
 
-Find your **Mac's local IP** (System Settings → Wi-Fi → Details, or `ifconfig en0` in Terminal).
+1. Find your **Mac's local IP**: System Settings → Wi-Fi → Details, or run `ifconfig en0` in Terminal.
+2. Place `keybridge.exe` anywhere and run:
 
-```bash
-pip install -r requirements_windows.txt
-python keybridge_windows.py 192.168.1.42   # ← your Mac's IP
+```
+keybridge.exe 192.168.1.42
 ```
 
-The Windows client connects automatically and reconnects if the connection drops.
+   A KeyBridge icon appears in the system tray. It connects to your Mac and auto-reconnects if the connection drops.
 
 ---
 
@@ -52,29 +54,49 @@ The Windows client connects automatically and reconnects if the connection drops
 
 | Action | Result |
 |--------|--------|
-| **Ctrl + Shift + \`** | Toggle between Local (Mac) and Windows mode |
-| Click the ⌨️ menu bar icon → *Switch to Windows Mode* | Same toggle, via menu |
+| **Ctrl + Shift + `** | Toggle Local ↔ Windows mode |
+| Click **⌨️** → *Switch to Windows Mode* | Same, via menu |
 
-- **⌨️** in the menu bar = Local mode (your Mac receives keystrokes)  
-- **🟢** in the menu bar = Windows mode (your Windows PC receives keystrokes)
-
----
-
-## Notes
-
-- All keys are relayed: letters, numbers, modifiers (Shift, Ctrl, Alt/Option, Win/Cmd), function keys, arrow keys, etc.
-- The switch hotkey always works, even while in Windows mode.
-- If the Windows client disconnects, KeyBridge will automatically reconnect when the client restarts.
-- Both apps must be running at the same time for relay to work.
+- **⌨️** = Local mode — keystrokes go to this Mac  
+- **🟢** = Windows mode — keystrokes go to the Windows PC
 
 ---
 
-## Requirements
+## Technical highlights
 
-| Side | Python | Packages |
-|------|--------|---------|
-| Mac | 3.8+ | `rumps`, `pynput` |
-| Windows | 3.8+ | `pynput` |
+| Thing | Mac | Windows |
+|-------|-----|---------|
+| Key capture | `CGEventTap` (kernel-level) | — |
+| Key injection | — | `SendInput` (Win32) |
+| Network | `NWConnection` TCP server | Winsock2 TCP client |
+| Latency trick | `TCP_NODELAY` on both ends | `TCP_NODELAY` |
+| Protocol | 4-byte binary frame | same |
+| RAM | ~3 MB | ~1 MB |
+| Language | Swift 5.9 | C99 |
+
+---
+
+## Build from source
+
+### Mac
+
+```bash
+cd mac
+chmod +x build_app.sh
+./build_app.sh
+# → mac/KeyBridge.app
+```
+
+Requires Xcode Command Line Tools (`xcode-select --install`).
+
+### Windows (MinGW)
+
+```bat
+cd windows
+gcc -O2 -o keybridge.exe keybridge.c -lws2_32 -mwindows
+```
+
+Or run `build.bat` which tries MinGW then MSVC automatically.
 
 ---
 
