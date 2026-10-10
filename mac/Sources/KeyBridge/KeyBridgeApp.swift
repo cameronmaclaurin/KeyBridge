@@ -8,6 +8,9 @@ enum KeyBridgeApp {
         if CommandLine.arguments.contains("--selftest-server") {
             SelfTest.runServer(CommandLine.arguments)  // never returns
         }
+        if CommandLine.arguments.contains("--selftest-pair-server") {
+            SelfTest.runPairServer(CommandLine.arguments)  // never returns
+        }
         #endif
 
         let app = NSApplication.shared

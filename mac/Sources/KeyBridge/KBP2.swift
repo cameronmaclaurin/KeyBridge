@@ -8,7 +8,10 @@ import Security
 enum KBP2 {
     static let port: UInt16 = 9876
 
-    static let magic: [UInt8] = Array("KBR2".utf8)
+    /// §1: the first 4 bytes a client sends pick the sub-protocol.
+    static let magicLength = 4
+    static let magic: [UInt8] = Array("KBR2".utf8)          // session (§4)
+    static let pairingMagic: [UInt8] = Array("KBPR".utf8)   // pairing (§2)
     static let clientHelloLength = 101          // magic(4) + pub(65) + nonce(32)
     static let serverHelloLength = 133          // magic(4) + pub(65) + nonce(32) + finished(32)
     static let serverHelloPrefixLength = 101
@@ -25,55 +28,6 @@ enum KBP2 {
         case ping = 0x02
         case pong = 0x03
         case releaseAll = 0x04
-    }
-}
-
-// MARK: - §2 Pairing code
-
-enum PairingCode {
-    static let alphabet: [Character] = Array("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
-    static let length = 20
-
-    /// 20 symbols, each `alphabet[randomByte & 0x1F]` from the OS CSPRNG.
-    static func generate() -> String {
-        var bytes = [UInt8](repeating: 0, count: length)
-        let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
-        precondition(status == errSecSuccess, "CSPRNG failure")
-        return String(bytes.map { alphabet[Int($0 & 0x1F)] })
-    }
-
-    /// Uppercase, drop `-` and whitespace, map O→0 and I/L→1; must be 20 alphabet symbols.
-    static func normalize(_ input: String) -> String? {
-        var out = ""
-        for ch in input.uppercased() {
-            if ch == "-" || ch.isWhitespace { continue }
-            switch ch {
-            case "O": out.append("0")
-            case "I", "L": out.append("1")
-            default: out.append(ch)
-            }
-        }
-        guard out.count == length, out.allSatisfy({ alphabet.contains($0) }) else { return nil }
-        return out
-    }
-
-    /// `ABCDE-FGHJK-MNPQR-STVWX`
-    static func display(_ normalized: String) -> String {
-        var groups: [String] = []
-        var current = ""
-        for ch in normalized {
-            current.append(ch)
-            if current.count == 5 { groups.append(current); current = "" }
-        }
-        if !current.isEmpty { groups.append(current) }
-        return groups.joined(separator: "-")
-    }
-
-    /// psk = HMAC-SHA256(key = "KeyBridge v2 pairing", data = normalized_code)
-    static func psk(normalized: String) -> SymmetricKey {
-        let mac = HMAC<SHA256>.authenticationCode(
-            for: Data(normalized.utf8), using: SymmetricKey(data: Data("KeyBridge v2 pairing".utf8)))
-        return SymmetricKey(data: Data(mac))
     }
 }
 
@@ -128,6 +82,10 @@ enum KBP2HandshakeError: Error {
     case badFinished
     case timeout
     case closed
+    /// A "KBR2" connection arrived but no long-term key is stored (not paired yet).
+    case notPaired
+    /// A "KBPR" connection arrived outside pairing mode, or while another pairing ran.
+    case pairingNotAllowed
 }
 
 /// Server half of the handshake. Feed it the ClientHello, send `serverHello`,
@@ -139,6 +97,7 @@ struct KBP2ServerHandshake {
     private let th2: Data
 
     /// §4 server steps 1–2. Throws on bad magic or an invalid P-256 point.
+    /// `psk` is the long-term key from pairing (§2).
     init(clientHello: Data, psk: SymmetricKey) throws {
         let ch = Data(clientHello)  // re-base indices at 0
         guard ch.count == KBP2.clientHelloLength else { throw KBP2HandshakeError.closed }
@@ -241,5 +200,141 @@ struct KBP2RecordChannel {
         if isDown { flags |= 0x01 }
         if isExtended { flags |= 0x02 }
         return (flags, UInt8(vk & 0xFF), UInt8(vk >> 8))
+    }
+}
+
+// MARK: - §2 Pairing (numeric comparison), responder side
+
+enum KBP2Pairing {
+    static let nameLength = 64
+    static let pairHelloLength = 133            // magic(4) + pc_pub(65) + pc_name(64)
+    static let pairCommitLength = 165           // magic(4) + mac_pub(65) + mac_name(64) + commit(32)
+    static let nonceLength = 32
+    static let confirmLength = 32
+
+    /// §2.4: PairHello through MacNonce within 10 s of connecting; then 120 s to confirm.
+    static let exchangeTimeout: TimeInterval = 10
+    static let confirmTimeout: TimeInterval = 120
+    /// §2.1: pairing mode lasts at most 3 minutes.
+    static let pairingModeDuration: TimeInterval = 180
+
+    /// §2.2: UTF-8, truncated at a character boundary to at most 64 bytes, NUL-padded to 64.
+    static func encodeName(_ name: String) -> Data {
+        var out = Data()
+        for ch in name where !ch.unicodeScalars.contains(where: { $0.value == 0 }) {
+            let bytes = Data(String(ch).utf8)
+            if out.count + bytes.count > nameLength { break }
+            out.append(bytes)
+        }
+        out.append(contentsOf: [UInt8](repeating: 0, count: nameLength - out.count))
+        return out
+    }
+
+    /// §2.2: bytes up to the first NUL, decoded leniently, control characters removed.
+    /// Also drops bidi overrides so a name can't visually reorder the surrounding text.
+    static func decodeName(_ field: Data) -> String {
+        let bytes = Data(field).prefix { $0 != 0 }
+        let decoded = String(decoding: bytes, as: UTF8.self)
+        var scalars = String.UnicodeScalarView()
+        for s in decoded.unicodeScalars {
+            if s.properties.generalCategory == .control { continue }
+            switch s.value {
+            case 0x200E, 0x200F, 0x202A...0x202E, 0x2066...0x2069: continue
+            default: scalars.append(s)
+            }
+        }
+        return String(scalars).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// `482 913`
+    static func formatSAS(_ sas: UInt32) -> String {
+        let digits = String(format: "%06u", sas % 1_000_000)
+        return String(digits.prefix(3)) + " " + String(digits.suffix(3))
+    }
+}
+
+enum KBP2PairingError: Error {
+    case badMagic
+    case invalidPoint
+    case badConfirm        // PcConfirm didn't verify
+    case closed            // peer closed, or sent something it shouldn't have
+    case timeout
+    case cancelled         // the Mac user (or the app) cancelled
+}
+
+/// Everything both sides derive once the nonces are exchanged (§2.3).
+struct KBP2PairingKeys {
+    let sas: UInt32
+    let ltk: SymmetricKey
+    let expectedPcConfirm: Data
+    let macConfirm: Data
+}
+
+/// Mac (responder) half of §2. Feed it the PairHello, send `pairCommit`; after receiving
+/// pc_nonce, `finish` yields the keys and only then may `macNonce` be sent.
+struct KBP2PairingResponder {
+    let pairCommit: Data
+    /// Sent only after pc_nonce has been received (§2.2).
+    let macNonce: Data
+    /// The PC's display name, sanitized for display.
+    let pcName: String
+
+    private let pairHello: Data
+    private let privateKey: P256.KeyAgreement.PrivateKey
+    private let pcPub: P256.KeyAgreement.PublicKey
+
+    init(pairHello: Data, macName: String) throws {
+        let ph = Data(pairHello)  // re-base indices at 0
+        guard ph.count == KBP2Pairing.pairHelloLength else { throw KBP2PairingError.closed }
+        guard ph.prefix(4).elementsEqual(KBP2.pairingMagic) else { throw KBP2PairingError.badMagic }
+
+        let pcPubBytes = ph.subdata(in: 4..<69)
+        guard pcPubBytes.first == 0x04,
+              let pcPub = try? P256.KeyAgreement.PublicKey(x963Representation: pcPubBytes)
+        else { throw KBP2PairingError.invalidPoint }
+
+        let key = P256.KeyAgreement.PrivateKey()
+        let macPub = key.publicKey.x963Representation         // 0x04 || X || Y, 65 bytes
+        let nonce = KBP2Crypto.randomBytes(KBP2Pairing.nonceLength)
+
+        // commit = HMAC-SHA256(key = mac_nonce, data = "KBPR commit" || mac_pub || pc_pub)
+        let commit = KBP2Crypto.hmac(key: SymmetricKey(data: nonce),
+                                     Data("KBPR commit".utf8) + macPub + pcPubBytes)
+
+        var pc = Data(KBP2.pairingMagic)
+        pc.append(macPub)
+        pc.append(KBP2Pairing.encodeName(macName))
+        pc.append(commit)
+
+        self.pairHello = ph
+        self.pairCommit = pc
+        self.macNonce = nonce
+        self.pcName = KBP2Pairing.decodeName(ph.subdata(in: 69..<133))
+        self.privateKey = key
+        self.pcPub = pcPub
+    }
+
+    /// §2.3 derivations, once pc_nonce has arrived.
+    func finish(pcNonce: Data) throws -> KBP2PairingKeys {
+        let nonce = Data(pcNonce)
+        guard nonce.count == KBP2Pairing.nonceLength else { throw KBP2PairingError.closed }
+        guard let shared = try? privateKey.sharedSecretFromKeyAgreement(with: pcPub)
+        else { throw KBP2PairingError.invalidPoint }
+        let ecdh = shared.withUnsafeBytes { Data($0) }         // X coordinate, 32 bytes
+
+        let th = KBP2Crypto.sha256(pairHello, pairCommit, nonce, macNonce)
+
+        let h = [UInt8](KBP2Crypto.sha256(Data("KBPR sas".utf8), th))
+        let first4 = UInt32(h[0]) << 24 | UInt32(h[1]) << 16 | UInt32(h[2]) << 8 | UInt32(h[3])
+
+        let prk = KBP2Crypto.extract(salt: SymmetricKey(data: th), ikm: ecdh)
+        let ltk = KBP2Crypto.expand(prk: prk, info: Data("KBPR long-term key".utf8))
+        let pcConfirm = KBP2Crypto.hmac(
+            key: KBP2Crypto.expand(prk: prk, info: Data("KBPR pc confirm".utf8)), th)
+        let macConfirm = KBP2Crypto.hmac(
+            key: KBP2Crypto.expand(prk: prk, info: Data("KBPR mac confirm".utf8)), th)
+
+        return KBP2PairingKeys(sas: first4 % 1_000_000, ltk: ltk,
+                               expectedPcConfirm: pcConfirm, macConfirm: macConfirm)
     }
 }

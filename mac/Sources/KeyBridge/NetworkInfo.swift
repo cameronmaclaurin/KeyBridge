@@ -3,6 +3,16 @@ import Foundation
 import SystemConfiguration
 
 enum NetworkInfo {
+    /// The user-visible computer name (System Settings → General → Sharing), e.g.
+    /// "Cameron's MacBook Air". Used as the Bonjour instance name and the pairing name.
+    static func computerName() -> String {
+        if let name = SCDynamicStoreCopyComputerName(nil, nil) as String?,
+           !name.trimmingCharacters(in: .whitespaces).isEmpty {
+            return name
+        }
+        return Host.current().localizedName ?? "Mac"
+    }
+
     /// Bonjour name, e.g. `Camerons-MacBook-Pro.local`.
     static func localHostName() -> String? {
         guard let name = SCDynamicStoreCopyLocalHostName(nil) as String?, !name.isEmpty else { return nil }
@@ -40,5 +50,32 @@ enum NetworkInfo {
                 return ra != rb ? ra < rb : a.iface < b.iface
             }
             .map(\.addr)
+    }
+}
+
+/// Calls `onChange` on the main queue when the computer name or local host name changes,
+/// so the Bonjour advertisement and the pairing window can follow a rename.
+final class SystemNameWatcher {
+    private let onChange: () -> Void
+    private var store: SCDynamicStore?
+
+    init(onChange: @escaping () -> Void) {
+        self.onChange = onChange
+        var ctx = SCDynamicStoreContext(version: 0, info: Unmanaged.passUnretained(self).toOpaque(),
+                                        retain: nil, release: nil, copyDescription: nil)
+        let callback: SCDynamicStoreCallBack = { _, _, info in
+            guard let info else { return }
+            let watcher = Unmanaged<SystemNameWatcher>.fromOpaque(info).takeUnretainedValue()
+            watcher.onChange()
+        }
+        guard let s = SCDynamicStoreCreate(nil, "KeyBridge" as CFString, callback, &ctx) else { return }
+        let keys = [SCDynamicStoreKeyCreateComputerName(nil), SCDynamicStoreKeyCreateHostNames(nil)] as CFArray
+        guard SCDynamicStoreSetNotificationKeys(s, keys, nil),
+              SCDynamicStoreSetDispatchQueue(s, .main) else { return }
+        store = s
+    }
+
+    deinit {
+        if let store { SCDynamicStoreSetDispatchQueue(store, nil) }
     }
 }

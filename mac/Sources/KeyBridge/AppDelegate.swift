@@ -10,7 +10,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let capture = KeyCapture()
     private var server: KBP2Server?
-    private var pairingCode = ""  // normalized
+    /// Display name of the paired PC; nil = not paired (no long-term key stored).
+    private var pairedPCName: String?
     private var remoteMode = false
     private var accessibilityGranted = false
     private var secureInputOn = false
@@ -20,9 +21,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var secureInputTimer: Timer?
     private var listenerRetryTimer: Timer?
     private var pairingWindow: PairingWindowController?
+    private var pairingExpiryTimer: Timer?
+    private var nameWatcher: SystemNameWatcher?
 
     private var modeLine: NSMenuItem!
     private var connLine: NSMenuItem!
+    private var pairedLine: NSMenuItem!
+    private var forgetItem: NSMenuItem!
     private var warningLine: NSMenuItem!
     private var accessibilityItem: NSMenuItem!
     private var toggleItem: NSMenuItem!
@@ -37,13 +42,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { _, _ in }
         }
 
-        let (code, isNew) = PairingStore.loadOrCreate()
-        pairingCode = code
-        startServer(psk: PairingCode.psk(normalized: code))
+        PairingStore.deleteLegacyCode()
+        var psk: SymmetricKey?
+        switch PairingStore.load() {
+        case .found(let pairing):
+            psk = pairing.ltk
+            pairedPCName = pairing.pcName
+        case .notFound:
+            break
+        case .failed(let status):
+            // e.g. the user denied Keychain access: run unpaired; pairing again replaces the item.
+            NSLog("[KeyBridge] Keychain read failed: \(status)")
+        }
+        startServer(psk: psk)
 
         startCapture()
         updateUI()
-        if isNew { showPairingWindow() }
+        if psk == nil { showPairingWindow() }
     }
 
     /// Opening the app again (Finder, Launchpad, `open`) while it runs: a menu-bar app would
@@ -63,12 +78,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: – Server
 
-    private func startServer(psk: SymmetricKey) {
+    private func startServer(psk: SymmetricKey?) {
         let s = KBP2Server(psk: psk)
         s.onListenerEvent = { [weak self] e in self?.listenerEvent(e) }
         s.onAuthenticated = { [weak self] host, replaced in self?.pcConnected(host, replaced: replaced) }
         s.onSessionEnded = { [weak self] in self?.pcDisconnected() }
+        s.onPairingEvent = { [weak self] e in self?.pairingEvent(e) }
+        let name = NetworkInfo.computerName()
+        s.macDisplayName = name
+        s.setServiceName(name)  // §1a: advertise _keybridge._tcp as this Mac's name
         server = s
+        nameWatcher = SystemNameWatcher { [weak self] in self?.systemNamesChanged() }
         // Hot path: tap callback → seal → send, all on the main thread, no extra hops.
         capture.onKeyEvent = { [unowned s] evt in
             s.sendKey(isDown: evt.isDown, isExtended: evt.isExtended, vk: evt.vk)
@@ -96,6 +116,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func retryListener() { server?.start() }
+
+    /// The computer was renamed (or its network name changed): follow it.
+    private func systemNamesChanged() {
+        let name = NetworkInfo.computerName()
+        server?.macDisplayName = name
+        server?.setServiceName(name)
+        pairingWindow?.refreshAddresses()
+    }
 
     private func pcConnected(_ host: String, replaced: String?) {
         if remoteMode, let replaced, replaced != host {
@@ -151,9 +179,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             openAccessibilitySettings()
         } else if server?.isAuthenticated == true {
             enterWindowsMode()
+        } else if pairedPCName == nil {
+            notify("No Windows PC paired", "Pair your PC with this Mac first.")
+            showPairingWindow()
         } else {
             notify("No Windows PC connected",
-                   "Open KeyBridge on your PC and connect it to this Mac. Choose “Pair a Windows PC…” in the menu for the address and code.")
+                   "Open KeyBridge on \(pairedPCName ?? "your PC") and make sure it’s on the same network as this Mac.")
         }
         updateUI()
     }
@@ -196,42 +227,128 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateUI()
     }
 
-    // MARK: – Pairing
+    // MARK: – Pairing (docs/PROTOCOL.md §2)
 
+    /// Opening the window starts pairing mode; closing it ends pairing mode.
     @objc private func showPairingWindow() {
-        if pairingWindow == nil {
-            let (status, connected) = connectionStatus()
-            let w = PairingWindowController(displayCode: PairingCode.display(pairingCode),
-                                            status: status, connected: connected)
-            w.onGenerateNewCode = { [weak self] in self?.generateNewCode() }
-            w.onClose = { [weak self] in self?.pairingWindow = nil }
-            pairingWindow = w
+        guard server != nil else { return }
+        if let w = pairingWindow {
+            switch w.state {
+            case .expired, .failed, .done: startPairingMode()
+            default: w.refreshAddresses()
+            }
         } else {
-            pairingWindow?.refreshAddresses()
+            let w = PairingWindowController(state: .expired)
+            w.onStartAgain = { [weak self] in self?.startPairingMode() }
+            w.onConfirm = { [weak self] in self?.confirmPairing() }
+            w.onCancel = { [weak self] in self?.server?.cancelPairing() }
+            w.onClose = { [weak self] in self?.pairingWindowClosed() }
+            pairingWindow = w
+            startPairingMode()
         }
         pairingWindow?.show()
     }
 
-    private func generateNewCode() {
-        let code = PairingCode.generate()
-        guard PairingStore.save(code) else {
-            let alert = NSAlert()
-            alert.messageText = "Couldn’t save the new code"
-            alert.informativeText = "KeyBridge couldn’t store the code in your Keychain, so the current code is unchanged."
-            alert.runModal()
-            return
+    /// §2.1: accept one pairing connection for at most 3 minutes.
+    private func startPairingMode() {
+        guard let server, !server.isPairing else { return }
+        server.pairingModeEnabled = true
+        pairingExpiryTimer?.invalidate()
+        pairingExpiryTimer = Timer.scheduledTimer(timeInterval: KBP2Pairing.pairingModeDuration, target: self,
+                                                  selector: #selector(pairingModeExpired),
+                                                  userInfo: nil, repeats: false)
+        pairingWindow?.setState(.waiting(deadline: Date().addingTimeInterval(KBP2Pairing.pairingModeDuration)))
+    }
+
+    /// No new pairing connections after 3 minutes. One already comparing numbers keeps its
+    /// own 120 s confirmation timeout.
+    @objc private func pairingModeExpired() {
+        pairingExpiryTimer = nil
+        server?.pairingModeEnabled = false
+        if case .waiting = pairingWindow?.state { pairingWindow?.setState(.expired) }
+    }
+
+    private func endPairingMode() {
+        pairingExpiryTimer?.invalidate()
+        pairingExpiryTimer = nil
+        server?.pairingModeEnabled = false
+    }
+
+    private func pairingWindowClosed() {
+        pairingWindow = nil
+        endPairingMode()
+        server?.cancelPairing()
+    }
+
+    private func confirmPairing() {
+        guard case .compare(let name, let sas) = pairingWindow?.state else { return }
+        pairingWindow?.setState(.waitingForPC(pcName: name, sas: sas))
+        server?.confirmPairing()  // may report .paired right away if the PC already confirmed
+    }
+
+    private func pairingEvent(_ e: KBP2Server.PairingEvent) {
+        switch e {
+        case .started:
+            pairingWindow?.show()  // a PC connected: bring the window to the front
+        case .compare(let name, let sas):
+            pairingWindow?.setState(.compare(pcName: name, sas: sas))
+            pairingWindow?.show()
+        case .paired(let ltk, let name):
+            endPairingMode()
+            guard PairingStore.save(ltk: ltk, pcName: name) else {
+                pairingWindow?.setState(.failed(detail:
+                    "KeyBridge couldn’t save the pairing in your Keychain. Click Start Again to try again."))
+                return
+            }
+            // Replaces any previous pairing; drop the current session (§2.4).
+            if remoteMode { leaveWindowsMode(sendReleaseAll: true) }
+            pairedPCName = name
+            server?.setPSK(ltk)
+            pairingWindow?.setState(.done(pcName: name))
+            pairingWindow?.show()
+            updateUI()
+        case .failed(let reason):
+            endPairingMode()
+            pairingWindow?.setState(.failed(detail: Self.describe(reason)))
         }
+    }
+
+    private static func describe(_ reason: KBP2PairingError) -> String {
+        switch reason {
+        case .cancelled:
+            return "Pairing was cancelled. Nothing was changed."
+        case .badConfirm:
+            return "The PC’s confirmation didn’t match. Make sure you chose this Mac on your PC, then try again."
+        case .timeout:
+            return "The PC didn’t respond in time. Make sure you click Confirm on both computers, then try again."
+        case .closed:
+            return "The PC cancelled pairing or disconnected."
+        case .badMagic, .invalidPoint:
+            return "The PC sent something KeyBridge didn’t understand. Make sure both computers have the latest KeyBridge."
+        }
+    }
+
+    @objc private func forgetPC() {
+        guard let name = pairedPCName else { return }
+        activate()
+        let alert = NSAlert()
+        alert.messageText = "Forget \(name)?"
+        alert.informativeText = "This Mac will stop sending keystrokes to \(name). To use them together again, pair again."
+        let forget = alert.addButton(withTitle: "Forget This PC")
+        forget.hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
         if remoteMode { leaveWindowsMode(sendReleaseAll: true) }
-        pairingCode = code
-        server?.setPSK(PairingCode.psk(normalized: code))  // disconnects the current PC
-        pairingWindow?.setCode(PairingCode.display(code))
+        PairingStore.delete()
+        pairedPCName = nil
+        server?.setPSK(nil)  // drops the current session; new ones are refused until paired
         updateUI()
     }
 
-    private func connectionStatus() -> (String, Bool) {
-        if let err = listenerError { return ("Can’t accept connections on port \(KBP2.port): \(err)", false) }
-        if let host = server?.peerHost { return ("PC connected: \(host)", true) }
-        return ("Waiting for your PC…", false)
+    private func connectionStatus() -> String? {
+        if let err = listenerError { return "Can’t accept connections on port \(KBP2.port): \(err)" }
+        if let host = server?.peerHost { return "PC connected: \(host)" }
+        return pairedPCName == nil ? nil : "PC not connected"
     }
 
     // MARK: – Launch at Login
@@ -310,12 +427,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.autoenablesItems = false
 
         modeLine = info("")
+        pairedLine = info("")
         connLine = info("")
         warningLine = info("")
         warningLine.isHidden = true
         accessibilityItem = item("Grant Accessibility Permission…", #selector(openAccessibilitySettings))
         accessibilityItem.isHidden = true
-        [modeLine, connLine, warningLine, accessibilityItem].forEach { menu.addItem($0) }
+        [modeLine, pairedLine, connLine, warningLine, accessibilityItem].forEach { menu.addItem($0) }
         menu.addItem(.separator())
 
         toggleItem = item("", #selector(onToggle))
@@ -325,6 +443,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
 
         menu.addItem(item("Pair a Windows PC…", #selector(showPairingWindow)))
+        forgetItem = item("Forget This PC…", #selector(forgetPC))
+        menu.addItem(forgetItem)
         loginItem = item("Launch at Login", #selector(toggleLaunchAtLogin))
         menu.addItem(loginItem)
         menu.addItem(.separator())
@@ -371,9 +491,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         modeLine.title = remoteMode ? "Windows mode: typing on your PC" : "Local mode: typing on this Mac"
 
-        let (status, connected) = connectionStatus()
-        connLine.title = status
-        pairingWindow?.setStatus(status, connected: connected)
+        pairedLine.title = pairedPCName.map { "Paired with \($0)" } ?? "Not paired"
+        let status = connectionStatus()
+        connLine.title = status ?? ""
+        connLine.isHidden = status == nil
+        forgetItem.isHidden = pairedPCName == nil
 
         warningLine.isHidden = !(remoteMode && secureInputOn)
         warningLine.title = "⚠︎ Secure Input is on in another app; keys stay on this Mac"

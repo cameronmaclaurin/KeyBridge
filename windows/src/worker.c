@@ -8,7 +8,6 @@
 #include "inject.h"
 
 #define KB_CONNECT_TIMEOUT_MS 3000 /* per resolved address */
-#define KB_BAD_CODE_RETRY_MS  10000
 
 typedef struct {
     HWND      notify;
@@ -104,15 +103,17 @@ static DWORD WINAPI worker_main(LPVOID param)
             break;
 
         if (st == KBP2_ERR_AUTH) {
-            post_status(w, KB_ST_BAD_CODE);
-            delay = KB_BAD_CODE_RETRY_MS; /* "no faster than every 10 s" */
-        } else {
-            if (st == KBP2_ERR_RESOLVE)
-                post_status(w, KB_ST_NOT_FOUND);
-            else if (w->last != KB_ST_WAITING)
-                post_status(w, KB_ST_WAITING);
-            delay = backoff_ms[attempt < ARRAYSIZE(backoff_ms) ? attempt : ARRAYSIZE(backoff_ms) - 1];
+            /* server_finished mismatch: this Mac does not have our key (it
+             * forgot us or paired with another PC). Stop retrying until the
+             * user pairs again or restarts the app (section 6). */
+            post_status(w, KB_ST_NOT_PAIRED);
+            break;
         }
+        if (st == KBP2_ERR_RESOLVE)
+            post_status(w, KB_ST_NOT_FOUND);
+        else if (w->last != KB_ST_WAITING)
+            post_status(w, KB_ST_WAITING);
+        delay = backoff_ms[attempt < ARRAYSIZE(backoff_ms) ? attempt : ARRAYSIZE(backoff_ms) - 1];
         if (attempt < ARRAYSIZE(backoff_ms))
             attempt++;
 

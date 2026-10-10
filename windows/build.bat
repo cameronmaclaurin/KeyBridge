@@ -7,8 +7,8 @@ rem   build.bat [version] [selftest]
 rem
 rem   build.bat 1.2.3           -> windows\build\KeyBridge.exe
 rem   build.bat 1.2.3 selftest  -> windows\build\KeyBridge-selftest.exe
-rem                                (docs/PROTOCOL.md Appendix A.2 conformance
-rem                                client; console app; never shipped)
+rem                                (docs/PROTOCOL.md Appendix A.2/A.4/A.5
+rem                                conformance hooks; console app; never shipped)
 rem
 rem version defaults to 0.0.0. A leading "v" and a "-suffix" are accepted;
 rem only MAJOR.MINOR.PATCH (each 0..65535) goes into VERSIONINFO.
@@ -67,7 +67,9 @@ if not exist "%OBJ%\" mkdir "%OBJ%" || goto :fail
 set "CFLAGS=/nologo /O2 /MT /W4 /sdl /GS /guard:cf /Gy /Gw /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN"
 set "LFLAGS=/NOLOGO /DYNAMICBASE /NXCOMPAT /HIGHENTROPYVA /GUARD:CF /CETCOMPAT /OPT:REF /OPT:ICF /INCREMENTAL:NO"
 set "LIBS=ws2_32.lib user32.lib shell32.lib gdi32.lib bcrypt.lib crypt32.lib comctl32.lib advapi32.lib"
-set "CORE=src\kbp2.c src\crypto.c src\kbutil.c"
+rem Protocol, pairing and discovery code shared by both builds (Appendix A:
+rem the selftest must run the same code as the app).
+set "CORE=src\kbp2.c src\pairing.c src\discovery.c src\crypto.c src\kbutil.c"
 
 if /i "%MODE%"=="selftest" goto :selftest
 
@@ -92,7 +94,7 @@ echo Built windows\%OUT%\KeyBridge.exe
 popd
 exit /b 0
 
-rem ---- Conformance selftest client (Appendix A.2) ----------------------------
+rem ---- Conformance selftest (Appendix A.2, A.4, A.5) ------------------------
 :selftest
 echo Building KeyBridge-selftest.exe %VMAJ%.%VMIN%.%VPAT%
 

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import os
 import queue
+import re
+import secrets
 import socket
 import subprocess
 import sys
@@ -21,7 +23,7 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 REFERENCE = os.path.join(REPO, "tests", "reference", "kbp2.py")
 
 sys.path.insert(0, os.path.dirname(REFERENCE))
-import kbp2  # noqa: E402  (reference implementation; used for pairing codes only)
+import kbp2  # noqa: E402  (reference implementation; the self-check unit-tests it)
 
 # docs/PROTOCOL.md Appendix A.2, copied literally (deliberately not imported
 # from the reference, so a reference bug cannot hide behind itself).
@@ -36,6 +38,18 @@ A2_TRANSCRIPT = [
     "CLOSED",
 ]
 
+# Appendix A.3/A.4 line shapes.
+SAS_LINE = re.compile(r"SAS (\d{6})")
+PAIRED_LINE = re.compile(r"PAIRED ([0-9a-f]{64})")
+
+# Display names for the pairing tests: a realistic one, and one that is longer
+# than the 64-byte name field and not ASCII (exercises truncation at a UTF-8
+# character boundary; the name is never printed, so this checks only that
+# pairing still succeeds).
+MAC_NAME = "Cameron's MacBook Air"
+PC_NAME = "DESKTOP-KB1"
+LONG_NAME = "Ordinateur de bureau très très long — ünïcödé ✓ " * 2
+
 READY_TIMEOUT = 20.0  # server start-up until it prints LISTENING
 PEER_TIMEOUT = 25.0  # any single process run
 WATCHDOG_TIMEOUT = 300.0  # the whole test file
@@ -48,6 +62,10 @@ class TestFailure(AssertionError):
     pass
 
 
+class TestSkipped(Exception):
+    """The environment cannot run this scenario (not a product failure). Reported, never silent."""
+
+
 def free_port() -> int:
     """A currently free TCP port on 127.0.0.1."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -55,14 +73,15 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-def new_code() -> str:
-    return kbp2.generate_code()
+def new_psk() -> str:
+    """A random 32-byte session psk (the ltk pairing would produce) as 64 hex digits."""
+    return secrets.token_hex(32)
 
 
-def other_code(code: str) -> str:
+def other_psk(psk: str) -> str:
     while True:
-        wrong = kbp2.generate_code()
-        if wrong != code:
+        wrong = new_psk()
+        if wrong != psk:
             return wrong
 
 
@@ -190,6 +209,13 @@ def run_pair(server_argv: list[str], client_argv: list[str], server_name="server
             client.kill()
 
 
+def run_alone(argv: list[str], name: str) -> Proc:
+    """Run one process to completion (e.g. a usage-error check)."""
+    proc = Proc(name, argv)
+    proc.wait(PEER_TIMEOUT)
+    return proc
+
+
 class Checks:
     """Collect every mismatch of a scenario, then fail once with both peers' output."""
 
@@ -214,6 +240,52 @@ class Checks:
                 f"{proc.name}: stdout mismatch\n  expected: {expected}\n  got:      {got}"
             )
 
+    # -- Appendix A.3/A.4 outcomes ------------------------------------------
+
+    def _lines(self, proc: Proc) -> list[str]:
+        """stdout lines, without a responder's leading LISTENING."""
+        lines = [line.rstrip() for line in proc.stdout]
+        return lines[1:] if lines[:1] == ["LISTENING"] else lines
+
+    def paired(self, proc: Proc) -> tuple[str | None, str | None]:
+        """Expect stdout exactly [SAS dddddd, PAIRED <ltk>] and exit 0. Returns (sas, ltk)."""
+        self.exit_code(proc, 0)
+        lines = self._lines(proc)
+        sas = SAS_LINE.fullmatch(lines[0]) if len(lines) == 2 else None
+        ltk = PAIRED_LINE.fullmatch(lines[1]) if len(lines) == 2 else None
+        if not (sas and ltk):
+            self.problems.append(f"{proc.name}: expected ['SAS dddddd', 'PAIRED <64 lowercase hex>'], got {lines}")
+            return None, None
+        return sas.group(1), ltk.group(1)
+
+    def cancelled(self, proc: Proc) -> str | None:
+        """Expect stdout exactly [SAS dddddd, CANCELLED] and exit 0. Returns the SAS."""
+        self.exit_code(proc, 0)
+        lines = self._lines(proc)
+        sas = SAS_LINE.fullmatch(lines[0]) if len(lines) == 2 and lines[1] == "CANCELLED" else None
+        if not sas:
+            self.problems.append(f"{proc.name}: expected ['SAS dddddd', 'CANCELLED'], got {lines}")
+            return None
+        return sas.group(1)
+
+    def pair_failed(self, proc: Proc, sas_first: bool | None) -> str | None:
+        """Expect exit 2 and stdout ending in PAIR FAILED.
+
+        sas_first=True: exactly [SAS dddddd, PAIR FAILED] (failure after the number was shown).
+        sas_first=False: exactly [PAIR FAILED] (failure before any number may be shown).
+        sas_first=None: either. Returns the SAS if one was printed.
+        """
+        self.exit_code(proc, 2)
+        lines = self._lines(proc)
+        sas = SAS_LINE.fullmatch(lines[0]) if len(lines) == 2 else None
+        ok_with = bool(sas) and lines[1] == "PAIR FAILED"
+        ok_without = lines == ["PAIR FAILED"]
+        allowed = {True: ok_with, False: ok_without, None: ok_with or ok_without}[sas_first]
+        if not allowed:
+            shape = {True: "['SAS dddddd', 'PAIR FAILED']", False: "['PAIR FAILED']", None: "[('SAS dddddd',) 'PAIR FAILED']"}
+            self.problems.append(f"{proc.name}: expected {shape[sas_first]}, got {lines}")
+        return sas.group(1) if sas else None
+
     def require(self, condition: bool, message: str) -> None:
         if not condition:
             self.problems.append(message)
@@ -224,12 +296,20 @@ class Checks:
             raise TestFailure("\n".join(self.problems) + "\n" + details)
 
 
-def ref_server(port: int, code: str, *extra: str) -> list[str]:
-    return [sys.executable, REFERENCE, "server", "--port", str(port), "--code", code, *extra]
+def ref_server(port: int, psk: str, *extra: str) -> list[str]:
+    return [sys.executable, REFERENCE, "server", "--port", str(port), "--psk", psk, *extra]
 
 
-def ref_client(port: int, code: str, *extra: str) -> list[str]:
-    return [sys.executable, REFERENCE, "client", "--host", "127.0.0.1", "--port", str(port), "--code", code, *extra]
+def ref_client(port: int, psk: str, *extra: str) -> list[str]:
+    return [sys.executable, REFERENCE, "client", "--host", "127.0.0.1", "--port", str(port), "--psk", psk, *extra]
+
+
+def ref_pair_server(port: int, name: str = MAC_NAME, *extra: str) -> list[str]:
+    return [sys.executable, REFERENCE, "pair-server", "--port", str(port), "--name", name, *extra]
+
+
+def ref_pair_client(port: int, name: str = PC_NAME, *extra: str) -> list[str]:
+    return [sys.executable, REFERENCE, "pair-client", "--host", "127.0.0.1", "--port", str(port), "--name", name, *extra]
 
 
 def require_binary(path: str, what: str) -> str:
@@ -262,10 +342,17 @@ def run_tests(title: str, tests: list[tuple[str, Callable[[], None]]]) -> int:
 
     print(f"== {title}", flush=True)
     failed: list[str] = []
+    skipped: list[str] = []
     for name, fn in tests:
         started = time.monotonic()
         try:
             fn()
+        except TestSkipped as exc:
+            skipped.append(name)
+            print(f"SKIP  {name} ({time.monotonic() - started:.1f} s): {exc}", flush=True)
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                message = f"{name}: {exc}".replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+                print(f"::warning title=Interop test skipped::{message}", flush=True)
         except TestFailure as exc:
             failed.append(name)
             print(f"FAIL  {name} ({time.monotonic() - started:.1f} s)", flush=True)
@@ -280,6 +367,11 @@ def run_tests(title: str, tests: list[tuple[str, Callable[[], None]]]) -> int:
             print(f"PASS  {name} ({time.monotonic() - started:.1f} s)", flush=True)
 
     watchdog.cancel()
-    passed = len(tests) - len(failed)
-    print(f"== {passed}/{len(tests)} passed" + (f"; failed: {', '.join(failed)}" if failed else ""), flush=True)
+    passed = len(tests) - len(failed) - len(skipped)
+    summary = f"== {passed}/{len(tests)} passed"
+    if skipped:
+        summary += f"; skipped: {', '.join(skipped)}"
+    if failed:
+        summary += f"; failed: {', '.join(failed)}"
+    print(summary, flush=True)
     return 1 if failed else 0

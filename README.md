@@ -44,16 +44,18 @@ flowchart LR
 The Mac app listens on TCP port 9876 and the Windows app connects to it. In **Local mode** your keyboard works normally. Press the hotkey to switch to **Windows mode**: each key press and release is encrypted and sent to the PC, which types it. Press the hotkey again to switch back.
 
 - **Keyboard only.** No mouse sharing. Both computers must be on the same local network.
+- **Finds your Mac for you.** The Mac announces itself on your network with Bonjour, so the PC lists it by name. You can still type an address.
 - **Native and small.** Swift/AppKit on the Mac (a ~300 KB universal app, under 20 MB of memory when measured). C/Win32 on Windows (one exe, no runtime).
 - **Low latency.** `TCP_NODELAY` is on, and each key event is one 20-byte encrypted record. Most of the delay you feel comes from your network, so wired Ethernet or 5 GHz Wi-Fi works best.
-- **Encrypted.** Each keystroke is encrypted and authenticated, and only a PC you've paired can connect. See [Security](#security).
+- **Encrypted.** Each keystroke is encrypted and authenticated, and only a PC you've paired can connect. Pairing works like Bluetooth: you check that both screens show the same 6-digit number. See [Security](#security).
 
 | On your Mac | On your PC |
 |---|---|
 | Menu-bar app with no Dock icon | System-tray app |
-| Pairing window that shows the Mac's address and pairing code | Setup window where you enter the Mac's address and pairing code |
+| Announces itself on your network (Bonjour) | Setup window that lists the Macs it finds, or takes the Mac's `Name.local` address or IP |
+| Pairing window: compare a 6-digit number and click **Confirm** | The same 6-digit number to compare and **Confirm** |
 | Launch at Login | Start with Windows |
-| A warning when macOS Secure Input blocks key capture | Reconnects automatically, and takes either the Mac's `Name.local` address or its IP |
+| A warning when macOS Secure Input blocks key capture | Reconnects automatically |
 
 ## Install & set up
 
@@ -74,11 +76,16 @@ KeyBridge appears in the menu bar as a keyboard icon. It doesn't get a Dock icon
 
 ### 3. Pair them (once)
 
-1. On the Mac, click the KeyBridge icon in the menu bar and choose **Pair a Windows PC…**. The window shows your Mac's address (such as `Your-Mac.local`) and a one-time pairing code (such as `ABCDE-FGHJK-MNPQR-STVWX`).
-2. On the PC, type the address and the code into the KeyBridge setup window and connect. Case and dashes in the code don't matter.
-3. Optional: turn on **Start with Windows**.
+Pairing works like pairing a Bluetooth keyboard: there's no code to type. If you're upgrading from KeyBridge 1.1, pair once more after updating both computers.
+
+1. On the Mac, click the KeyBridge icon in the menu bar and choose **Pair a Windows PC…**. Keep this window open while you pair.
+2. On the PC, open the KeyBridge setup window, pick your Mac from the list and click **Pair**. If your Mac isn't listed, type the address shown in the Mac's Pairing window instead (such as `Your-Mac.local` or `192.168.1.20`).
+3. Both screens now show a 6-digit number, such as **482 913**. **Check that the two numbers are the same**, then click **Confirm** on the Mac and on the PC. If they're different, click **Cancel** ([why](#the-numbers-dont-match)).
+4. Optional: turn on **Start with Windows**.
 
 When the PC connects, the Windows tray icon turns from gray to color. That's it. Press <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>&#96;</kbd> on the Mac and start typing on the PC.
+
+The Mac's Pairing window accepts a PC for 3 minutes. If that runs out, click **Start Again**. Pairing a new PC replaces the old one. To remove a pairing, choose **Forget This PC…** in the Mac's KeyBridge menu, or **Forget** on the PC.
 
 ## Using it
 
@@ -108,9 +115,11 @@ For example, <kbd>⌘</kbd> opens the Start menu, and Windows shortcuts like <kb
 
 ## Security
 
-- **Pairing.** The Mac shows a one-time pairing code with about 100 bits of randomness. Both sides prove they know the code before any keystroke is sent. A device without the code can't receive your typing or inject keys into your PC.
+- **Pairing with no secret to type.** The Mac and the PC agree on a new random key with an ECDH P-256 exchange, as Bluetooth does. After that, both sides prove they hold that key before any keystroke is sent. A device that isn't paired can't receive your typing or inject keys into your PC.
+- **The 6-digit number stops eavesdroppers.** If another device on your network tried to get in the middle of pairing, the two screens would show different numbers. Each attempt has a 1 in 1,000,000 chance of matching by luck, and every attempt needs you to click Confirm on both computers. So do compare the numbers. They aren't secret, and you never type them.
+- **Pairing only when you ask.** The Mac accepts a new PC only while its Pairing window is open, for up to 3 minutes. The PC pairs only when you click Pair.
 - **Encryption.** Every keystroke is encrypted and authenticated with AES-256-GCM.
-- **Forward secrecy.** Each connection uses fresh keys from an ECDH P-256 exchange, so recorded traffic stays secret even if the pairing code leaks later.
+- **Forward secrecy.** Each connection uses fresh keys from another ECDH P-256 exchange, so recorded traffic stays secret even if the pairing key leaks later.
 - **No stuck keys.** Held keys are released when you switch modes or the connection drops.
 
 The full threat model is in [`SECURITY.md`](SECURITY.md) and the wire protocol in [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
@@ -139,9 +148,34 @@ On Windows, `Get-FileHash .\KeyBridge-Windows-Setup.exe` in PowerShell prints th
 </details>
 
 <details>
-<summary><strong>"Pairing code doesn't match"</strong></summary>
+<summary><strong>My Mac isn't in the PC's list</strong></summary>
 
-Generate a new code in the Mac's **Pair a Windows PC…** window, then type it into the Windows setup window again. The code is easy to mistype. Case and dashes don't matter, but every character does.
+- Check that both computers are on the **same local network**, and that KeyBridge is running on the Mac.
+- Open **Pair a Windows PC…** on the Mac and keep the window open while you pair.
+- **Firewall:** the list uses Bonjour (multicast DNS, UDP port 5353), which some firewalls, security software and guest Wi-Fi networks block. If the macOS firewall is on, allow KeyBridge to accept incoming connections.
+- **Type the address instead.** The list is only a shortcut. Type the Mac's name followed by `.local` (such as `Your-Mac.local`), or its IP address. The Mac's Pairing window shows both.
+
+</details>
+
+<details>
+<summary><strong>"Not paired with this Mac — pair again"</strong></summary>
+
+The Mac and the PC no longer share the same key. This happens if you clicked **Forget** on one of them, paired the Mac with a different PC, reinstalled, or upgraded from KeyBridge 1.1. [Pair them](#3-pair-them-once) again.
+
+</details>
+
+<a name="the-numbers-dont-match"></a>
+<details>
+<summary><strong>The numbers don't match</strong></summary>
+
+Click **Cancel** on both computers. Nothing is saved. Different numbers mean the two computers didn't connect directly to each other: you may have picked the wrong Mac or PC, or another device on your network may be trying to interfere. Check that you chose the right Mac, then try again. If the numbers keep being different, don't confirm, and pair on a network you trust.
+
+</details>
+
+<details>
+<summary><strong>"Pairing didn't complete"</strong></summary>
+
+Someone clicked **Cancel**, the 3 minutes ran out, the Pairing window was closed, or the connection dropped. Nothing was saved. Click **Start Again** on the Mac and **Pair** on the PC.
 
 </details>
 
@@ -199,6 +233,9 @@ The builds aren't signed with paid Apple or Microsoft certificates yet. The CI p
 
 **Which systems are supported?**
 macOS 13 or later on Apple Silicon or Intel, and 64-bit Windows 10 or 11.
+
+**What is `SHA256SUMS.txt`?**
+An optional file for checking your downloads. It lists a fingerprint (SHA-256 hash) of every file in the release, so you can confirm that what you downloaded is exactly what was published. The release workflow generates it automatically. You don't need it to install KeyBridge. See [Verify your download](#verify-your-download).
 
 ## License
 

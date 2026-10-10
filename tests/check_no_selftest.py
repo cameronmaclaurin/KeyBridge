@@ -10,7 +10,13 @@ Usage: python tests/check_no_selftest.py <binary> [<binary> ...]
 
 import sys
 
-MARKERS = ["--selftest-server", "--selftest-client"]
+MARKERS = [
+    "--selftest-server",
+    "--selftest-client",
+    "--selftest-pair-server",
+    "--selftest-pair-client",
+    "--selftest-discover",
+]
 
 
 def main(paths):

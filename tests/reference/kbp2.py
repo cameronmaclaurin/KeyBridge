@@ -2,13 +2,16 @@
 """KBP2 reference implementation (KeyBridge Protocol v2).
 
 This file is the executable companion to docs/PROTOCOL.md, which is the source
-of truth. It favours readability over speed: every step of the handshake and
-record layer maps to a numbered rule in the spec.
+of truth. It favours readability over speed: every step of pairing, the
+handshake and the record layer maps to a numbered rule in the spec. When the
+Mac and Windows apps disagree, this file (and then the spec) decides.
 
 Roles (docs/PROTOCOL.md Appendix A):
 
-  server  A.1 selftest server   python kbp2.py server --port P --code CODE
-  client  A.2 selftest client   python kbp2.py client --host H --port P --code CODE
+  server       A.1 selftest server      kbp2.py server --port P --psk HEX64
+  client       A.2 selftest client      kbp2.py client --host H --port P --psk HEX64
+  pair-server  A.3 pairing responder    kbp2.py pair-server --port P --name NAME [--confirm yes|no]
+  pair-client  A.4 pairing initiator    kbp2.py pair-client --host H --port P --name NAME [--confirm yes|no]
 
 Negative-test options (not part of the spec; used by tests/interop/):
 
@@ -24,12 +27,31 @@ Negative-test options (not part of the spec; used by tests/interop/):
   server --replay-record      send the first KEY record twice (same ciphertext).
       A correct client must drop the connection at the bad record.
 
+  pair-server --bad-commit       send a commit that does not match mac_nonce.
+  pair-server --corrupt-confirm  send a wrong MacConfirm.
+  pair-server --invalid-point    send a PairCommit whose mac_pub is not on P-256.
+      A correct initiator prints PAIR FAILED and exits 2 (and, for the first
+      and last, never prints SAS: SAS comes only after the commit checks out).
+      The responder itself otherwise follows A.3.
+
+  pair-client --corrupt-confirm  send a wrong PcConfirm (otherwise follows A.4).
+      A correct responder prints PAIR FAILED and exits 2.
+  pair-client --invalid-point    send a PairHello whose pc_pub is not on P-256.
+  pair-client --withhold-nonce   read PairCommit, then never send PcNonce.
+      These two print REJECTED and exit 0 iff the responder closes without
+      sending any further byte (for --withhold-nonce: it must never send
+      mac_nonce before pc_nonce, spec 2.2, and must give up after 10 s,
+      spec 2.4); otherwise they print NOT REJECTED and exit 1.
+
 Exit codes:
-  server: 0 success, 2 handshake failed, 3 no PONG            (spec A.1)
-  client: 0 success / CLOSED, 2 HANDSHAKE FAILED               (spec A.2)
-          1 anything else (record authentication failure, liveness timeout,
-            connection error, negative-test expectation not met)
-  both:   64 usage error (bad arguments or an invalid pairing code)
+  server:      0 success, 2 handshake failed, 3 no PONG       (spec A.1)
+  client:      0 success / CLOSED, 2 HANDSHAKE FAILED          (spec A.2)
+               1 anything else (record authentication failure, liveness
+                 timeout, connection error, negative-test expectation not met)
+  pair-server, pair-client:
+               0 PAIRED or CANCELLED, 2 PAIR FAILED            (spec A.3, A.4)
+               1 negative-test expectation not met
+  all:         64 usage error (bad arguments, e.g. a --psk that is not 64 hex digits)
 
 Requires the `cryptography` package (see tests/requirements.txt).
 """
@@ -40,10 +62,11 @@ import argparse
 import hashlib
 import hmac
 import os
-import secrets
+import re
 import socket
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass
 
 try:
@@ -59,11 +82,27 @@ except ImportError:  # pragma: no cover
 # ---------------------------------------------------------------------------
 
 DEFAULT_PORT = 9876
+PSK_LEN = 32  # the session psk is the 32-byte ltk from pairing
 
-ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  # Crockford Base32
-CODE_LENGTH = 20
-PAIRING_HMAC_KEY = b"KeyBridge v2 pairing"
+# Pairing (spec section 2)
+PAIR_MAGIC = b"KBPR"
+NAME_LEN = 64  # UTF-8, truncated at a character boundary, NUL-padded
+PAIR_HELLO_LEN = 4 + 65 + NAME_LEN  # "KBPR" || pc_pub || pc_name = 133
+COMMIT_LEN = 32
+PAIR_COMMIT_LEN = 4 + 65 + NAME_LEN + COMMIT_LEN  # "KBPR" || mac_pub || mac_name || commit = 165
+PAIR_NONCE_LEN = 32
+CONFIRM_LEN = 32
 
+LABEL_COMMIT = b"KBPR commit"
+LABEL_SAS = b"KBPR sas"
+LABEL_LTK = b"KBPR long-term key"
+LABEL_PC_CONFIRM = b"KBPR pc confirm"
+LABEL_MAC_CONFIRM = b"KBPR mac confirm"
+
+PAIR_SETUP_TIMEOUT = 10.0  # PairHello through MacNonce, from connecting (spec 2.4)
+PAIR_CONFIRM_TIMEOUT = 120.0  # confirmation phase (spec 2.4)
+
+# Session (spec sections 4-6)
 MAGIC = b"KBR2"
 PUBKEY_LEN = 65  # 0x04 || X(32) || Y(32)
 NONCE_LEN = 32
@@ -105,6 +144,7 @@ SELFTEST_KEYS = [  # (flags, vk)
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_HANDSHAKE_FAILED = 2
+EXIT_PAIR_FAILED = 2
 EXIT_NO_PONG = 3
 EXIT_USAGE = 64
 
@@ -127,38 +167,20 @@ def debug(name: str, value: bytes) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Pairing code (spec section 2)
+# Session psk on the command line (Appendix A.2)
 # ---------------------------------------------------------------------------
 
-
-class InvalidCode(ValueError):
-    pass
+_PSK_RE = re.compile(r"[0-9A-Fa-f]{64}")
 
 
-def generate_code() -> str:
-    """20 symbols, each alphabet[randomByte & 0x1F] from a CSPRNG."""
-    return "".join(ALPHABET[b & 0x1F] for b in secrets.token_bytes(CODE_LENGTH))
+def parse_psk(text: str) -> bytes:
+    """--psk: exactly 64 hex digits, case-insensitive. Anything else is a usage error.
 
-
-def format_code(code: str) -> str:
-    """Display form: 4 groups of 5 separated by '-'."""
-    code = normalize_code(code)
-    return "-".join(code[i : i + 5] for i in range(0, CODE_LENGTH, 5))
-
-
-def normalize_code(raw: str) -> str:
-    """Spec 2 normalization. Raises InvalidCode if the result is not valid."""
-    code = raw.upper()
-    code = "".join(ch for ch in code if ch != "-" and not ch.isspace())
-    code = code.replace("O", "0").replace("I", "1").replace("L", "1")
-    if len(code) != CODE_LENGTH or any(ch not in ALPHABET for ch in code):
-        raise InvalidCode(f"pairing code must be {CODE_LENGTH} symbols from {ALPHABET}")
-    return code
-
-
-def derive_psk(code: str) -> bytes:
-    """psk = HMAC-SHA256(key = "KeyBridge v2 pairing", data = normalized_code)."""
-    return hmac.new(PAIRING_HMAC_KEY, normalize_code(code).encode("ascii"), hashlib.sha256).digest()
+    (bytes.fromhex alone would also accept spaces, so check the shape first.)
+    """
+    if not _PSK_RE.fullmatch(text):
+        raise argparse.ArgumentTypeError(f"--psk must be {2 * PSK_LEN} hex digits, got {len(text)} characters")
+    return bytes.fromhex(text)
 
 
 # ---------------------------------------------------------------------------
@@ -203,13 +225,13 @@ def ecdh(private: ec.EllipticCurvePrivateKey, peer: ec.EllipticCurvePublicKey) -
     return private.exchange(ec.ECDH(), peer)
 
 
-# ---------------------------------------------------------------------------
-# Handshake (spec section 4)
-# ---------------------------------------------------------------------------
+# An uncompressed point that is not on P-256, for negative tests: (1, 1).
+INVALID_POINT = b"\x04" + (1).to_bytes(32, "big") + (1).to_bytes(32, "big")
 
 
-class HandshakeError(Exception):
-    pass
+# ---------------------------------------------------------------------------
+# Socket helpers (spec sections 1 and 5)
+# ---------------------------------------------------------------------------
 
 
 class PeerClosed(Exception):
@@ -219,6 +241,161 @@ class PeerClosed(Exception):
         super().__init__(f"peer closed after {received} of {wanted} bytes")
         self.received = received
         self.wanted = wanted
+
+
+def recv_exact(sock: socket.socket, n: int, deadline: float | None) -> bytes:
+    """Read exactly n bytes. Raises PeerClosed on EOF/reset, TimeoutError past deadline."""
+    buf = bytearray()
+    while len(buf) < n:
+        if deadline is None:
+            sock.settimeout(None)
+        else:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"timed out after {len(buf)} of {n} bytes")
+            sock.settimeout(remaining)
+        try:
+            chunk = sock.recv(n - len(buf))
+        except socket.timeout as exc:  # socket.timeout is TimeoutError on 3.10+
+            raise TimeoutError(f"timed out after {len(buf)} of {n} bytes") from exc
+        except (ConnectionResetError, ConnectionAbortedError):
+            raise PeerClosed(len(buf), n) from None
+        if not chunk:
+            raise PeerClosed(len(buf), n)
+        buf += chunk
+    return bytes(buf)
+
+
+def graceful_close(sock: socket.socket) -> None:
+    """Spec 5 graceful close: send FIN, drain whatever the peer still sends (briefly), then close.
+
+    Closing a TCP socket with unread received data makes most stacks send RST,
+    which can destroy data the peer has not read yet.
+    """
+    try:
+        sock.shutdown(socket.SHUT_WR)
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            sock.settimeout(max(0.01, deadline - time.monotonic()))
+            if not sock.recv(4096):
+                break
+    except OSError:
+        pass
+    finally:
+        sock.close()
+
+
+def expect_silent_close(sock: socket.socket, timeout: float, what: str) -> int:
+    """Negative tests: succeed iff the peer closes without sending another byte."""
+    started = time.monotonic()
+    try:
+        data = recv_exact(sock, 1, started + timeout)
+    except PeerClosed:
+        log(f"{what}: peer closed the connection after {time.monotonic() - started:.2f} s")
+        out("REJECTED")
+        return EXIT_OK
+    except TimeoutError:
+        out(f"NOT REJECTED: peer kept the connection open for {timeout:.0f} s")
+        return EXIT_ERROR
+    out(f"NOT REJECTED: peer sent data ({data.hex()}...)")
+    return EXIT_ERROR
+
+
+def listen_once(port: int) -> tuple[socket.socket, float]:
+    """Listen on 127.0.0.1:port, print LISTENING, accept exactly one connection.
+
+    Returns (connection, accept time).
+    """
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", port))
+    listener.listen(1)
+    out("LISTENING")
+
+    conn, peer = listener.accept()
+    accepted_at = time.monotonic()
+    listener.close()
+    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    log(f"accepted {peer[0]}:{peer[1]}")
+    return conn, accepted_at
+
+
+# ---------------------------------------------------------------------------
+# Pairing: messages and derivations (spec sections 2.2, 2.3)
+# ---------------------------------------------------------------------------
+
+
+class PairingError(Exception):
+    pass
+
+
+def encode_name(name: str) -> bytes:
+    """Display name -> 64 bytes: UTF-8, truncated at a character boundary, NUL-padded."""
+    encoded = b""
+    for ch in name:
+        piece = ch.encode("utf-8")
+        if len(encoded) + len(piece) > NAME_LEN:
+            break
+        encoded += piece
+    return encoded.ljust(NAME_LEN, b"\x00")
+
+
+def decode_name(field: bytes) -> str:
+    """Bytes up to the first NUL, decoded leniently, with control characters removed."""
+    text = field.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+    return "".join(ch for ch in text if unicodedata.category(ch) != "Cc")
+
+
+def commitment(mac_nonce: bytes, mac_pub: bytes, pc_pub: bytes) -> bytes:
+    """commit = HMAC-SHA256(key = mac_nonce, data = "KBPR commit" || mac_pub || pc_pub)."""
+    return hmac_sha256(mac_nonce, LABEL_COMMIT + mac_pub + pc_pub)
+
+
+@dataclass
+class PairingKeys:
+    th: bytes
+    sas: int  # 0..999999
+    ltk: bytes  # 32 bytes; becomes the session psk
+    pc_confirm: bytes
+    mac_confirm: bytes
+
+
+def pairing_keys(shared: bytes, pair_hello: bytes, pair_commit: bytes, pc_nonce: bytes, mac_nonce: bytes) -> PairingKeys:
+    """Spec 2.3. Both sides run this identically once both nonces are known."""
+    assert len(pair_hello) == PAIR_HELLO_LEN and len(pair_commit) == PAIR_COMMIT_LEN
+    th = hashlib.sha256(pair_hello + pair_commit + pc_nonce + mac_nonce).digest()
+    sas = int.from_bytes(hashlib.sha256(LABEL_SAS + th).digest()[0:4], "big") % 1_000_000
+    prk = extract(salt=th, ikm=shared)
+    ltk = expand(prk, LABEL_LTK)
+    pc_confirm = hmac_sha256(expand(prk, LABEL_PC_CONFIRM), th)
+    mac_confirm = hmac_sha256(expand(prk, LABEL_MAC_CONFIRM), th)
+
+    debug("ecdh", shared)
+    debug("TH", th)
+    debug("prk", prk)
+    debug("ltk", ltk)
+    debug("pc_confirm", pc_confirm)
+    debug("mac_confirm", mac_confirm)
+    return PairingKeys(th, sas, ltk, pc_confirm, mac_confirm)
+
+
+def format_sas(sas: int) -> str:
+    """How the apps display the number: 6 digits with leading zeros, grouped "482 913"."""
+    digits = f"{sas:06d}"
+    return f"{digits[:3]} {digits[3:]}"
+
+
+def flip_first_bit(data: bytes) -> bytes:
+    return bytes([data[0] ^ 0x01]) + data[1:]
+
+
+# ---------------------------------------------------------------------------
+# Handshake (spec section 4)
+# ---------------------------------------------------------------------------
+
+
+class HandshakeError(Exception):
+    pass
 
 
 @dataclass
@@ -262,38 +439,18 @@ def split_hello(data: bytes) -> tuple[bytes, bytes, bytes]:
     return magic, pub, nonce
 
 
-def recv_exact(sock: socket.socket, n: int, deadline: float | None) -> bytes:
-    """Read exactly n bytes. Raises PeerClosed on EOF/reset, TimeoutError past deadline."""
-    buf = bytearray()
-    while len(buf) < n:
-        if deadline is None:
-            sock.settimeout(None)
-        else:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(f"timed out after {len(buf)} of {n} bytes")
-            sock.settimeout(remaining)
-        try:
-            chunk = sock.recv(n - len(buf))
-        except socket.timeout as exc:  # socket.timeout is TimeoutError on 3.10+
-            raise TimeoutError(f"timed out after {len(buf)} of {n} bytes") from exc
-        except (ConnectionResetError, ConnectionAbortedError):
-            raise PeerClosed(len(buf), n) from None
-        if not chunk:
-            raise PeerClosed(len(buf), n)
-        buf += chunk
-    return bytes(buf)
-
-
 def server_handshake(sock: socket.socket, psk: bytes, accepted_at: float) -> KeySchedule:
     """Spec 4 server steps 1-5. Raises HandshakeError; the caller closes silently."""
     deadline = accepted_at + HANDSHAKE_TIMEOUT
     try:
-        # 1. ClientHello: magic and a valid P-256 point.
-        client_hello = recv_exact(sock, CLIENT_HELLO_LEN, deadline)
-        magic, client_pub, _client_nonce = split_hello(client_hello)
+        # 1. ClientHello: magic and a valid P-256 point. Spec 1: dispatch on the
+        #    first 4 bytes, so a wrong magic is rejected without waiting for more.
+        #    This selftest server is session-only; "KBPR" (pairing) is a bad magic here.
+        magic = recv_exact(sock, len(MAGIC), deadline)
         if magic != MAGIC:
             raise HandshakeError(f"bad magic {magic!r}")
+        client_hello = magic + recv_exact(sock, CLIENT_HELLO_LEN - len(MAGIC), deadline)
+        _magic, client_pub, _client_nonce = split_hello(client_hello)
         try:
             peer = parse_public_key(client_pub)
         except ValueError as exc:
@@ -416,42 +573,10 @@ def key_record(flags: int, vk: int) -> tuple[int, int, int, int]:
 # ---------------------------------------------------------------------------
 
 
-def graceful_close(sock: socket.socket) -> None:
-    """Send FIN, drain whatever the peer still sends (briefly), then close.
-
-    Closing a TCP socket with unread received data makes most stacks send RST,
-    which can destroy records the peer has not read yet.
-    """
-    try:
-        sock.shutdown(socket.SHUT_WR)
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
-            sock.settimeout(max(0.01, deadline - time.monotonic()))
-            if not sock.recv(4096):
-                break
-    except OSError:
-        pass
-    finally:
-        sock.close()
-
-
 def run_server(args: argparse.Namespace) -> int:
-    psk = derive_psk(args.code)
-
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener.bind(("127.0.0.1", args.port))
-    listener.listen(1)
-    out("LISTENING")
-
-    conn, peer = listener.accept()
-    accepted_at = time.monotonic()
-    listener.close()
-    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    log(f"accepted {peer[0]}:{peer[1]}")
-
+    conn, accepted_at = listen_once(args.port)
     try:
-        keys = server_handshake(conn, psk, accepted_at)
+        keys = server_handshake(conn, args.psk, accepted_at)
     except HandshakeError as exc:
         log(f"handshake failed: {exc}")
         conn.close()  # silently: nothing else is sent
@@ -509,22 +634,6 @@ def run_server(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
-def expect_silent_close(sock: socket.socket, timeout: float, what: str) -> int:
-    """Negative tests: succeed iff the server closes without sending another byte."""
-    started = time.monotonic()
-    try:
-        data = recv_exact(sock, 1, started + timeout)
-    except PeerClosed:
-        log(f"{what}: server closed the connection after {time.monotonic() - started:.2f} s")
-        out("REJECTED")
-        return EXIT_OK
-    except TimeoutError:
-        out(f"NOT REJECTED: server kept the connection open for {timeout:.0f} s")
-        return EXIT_ERROR
-    out(f"NOT REJECTED: server sent data ({data.hex()}...)")
-    return EXIT_ERROR
-
-
 def format_event(plaintext: bytes) -> str | None:
     """A.2 stdout line for a received record, or None if it is ignored."""
     type_, b1, b2, b3 = plaintext
@@ -543,8 +652,6 @@ def format_event(plaintext: bytes) -> str | None:
 
 
 def run_client(args: argparse.Namespace) -> int:
-    psk = derive_psk(args.code)
-
     try:
         sock = socket.create_connection((args.host, args.port), timeout=HANDSHAKE_TIMEOUT)
     except OSError as exc:
@@ -553,7 +660,7 @@ def run_client(args: argparse.Namespace) -> int:
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
     try:
-        return client_session(sock, psk, args)
+        return client_session(sock, args.psk, args)
     finally:
         sock.close()
 
@@ -565,7 +672,7 @@ def client_session(sock: socket.socket, psk: bytes, args: argparse.Namespace) ->
         if args.bad_magic:
             magic = b"KBRX"
         if args.invalid_point:
-            pub = b"\x04" + (1).to_bytes(32, "big") + (1).to_bytes(32, "big")  # (1, 1) is not on P-256
+            pub = INVALID_POINT
         sock.sendall(magic + pub + os.urandom(NONCE_LEN))
         what = "bad magic" if args.bad_magic else "invalid point"
         return expect_silent_close(sock, args.reject_timeout, what)
@@ -581,7 +688,7 @@ def client_session(sock: socket.socket, psk: bytes, args: argparse.Namespace) ->
         out("HANDSHAKE FAILED")
         return EXIT_HANDSHAKE_FAILED
     if not server_finished_ok:
-        log("Pairing code doesn't match (server_finished mismatch)")
+        log("Not paired with this Mac — pair again (server_finished mismatch)")
         out("HANDSHAKE FAILED")  # 3. do not send ClientFinished
         return EXIT_HANDSHAKE_FAILED
 
@@ -589,8 +696,7 @@ def client_session(sock: socket.socket, psk: bytes, args: argparse.Namespace) ->
         return expect_silent_close(sock, args.reject_timeout, "stalled handshake")
 
     if args.corrupt_finished:
-        bad = bytes([keys.client_finished[0] ^ 0x01]) + keys.client_finished[1:]
-        sock.sendall(bad)
+        sock.sendall(flip_first_bit(keys.client_finished))
         return expect_silent_close(sock, args.reject_timeout, "corrupted ClientFinished")
 
     # 4. Match: send ClientFinished; the session is authenticated.
@@ -624,12 +730,176 @@ def client_session(sock: socket.socket, psk: bytes, args: argparse.Namespace) ->
 
 
 # ---------------------------------------------------------------------------
+# Pairing selftest responder (Appendix A.3) and initiator (Appendix A.4)
+# ---------------------------------------------------------------------------
+
+
+def run_pairing(sock: socket.socket, role) -> int:
+    """Run one side of spec section 2; any failure -> PAIR FAILED, exit 2, nothing stored."""
+    try:
+        return role()
+    except PairingError as exc:
+        why = str(exc)
+    except TimeoutError as exc:  # before OSError: TimeoutError is an OSError
+        why = f"timeout: {exc}"
+    except PeerClosed as exc:
+        why = str(exc)
+    except OSError as exc:
+        why = f"socket error: {exc}"
+    log(f"Pairing didn't complete: {why}")
+    out("PAIR FAILED")
+    sock.close()
+    return EXIT_PAIR_FAILED
+
+
+def run_pair_server(args: argparse.Namespace) -> int:
+    conn, accepted_at = listen_once(args.port)  # A.3: always in pairing mode
+    return run_pairing(conn, lambda: pair_responder(conn, accepted_at, args))
+
+
+def pair_responder(conn: socket.socket, accepted_at: float, args: argparse.Namespace) -> int:
+    """The Mac's side of spec 2.2-2.4."""
+    setup_deadline = accepted_at + PAIR_SETUP_TIMEOUT
+
+    # PairHello. Spec 1: dispatch on the first 4 bytes; this responder speaks only "KBPR".
+    magic = recv_exact(conn, len(PAIR_MAGIC), setup_deadline)
+    if magic != PAIR_MAGIC:
+        raise PairingError(f"bad magic {magic!r}")
+    pair_hello = magic + recv_exact(conn, PAIR_HELLO_LEN - len(PAIR_MAGIC), setup_deadline)
+    pc_pub = pair_hello[4 : 4 + PUBKEY_LEN]
+    pc_name = pair_hello[4 + PUBKEY_LEN :]
+    try:
+        peer = parse_public_key(pc_pub)
+    except ValueError as exc:
+        raise PairingError(f"invalid pc_pub: {exc}") from None
+    log(f"PC name: {decode_name(pc_name)!r}")
+
+    # PairCommit: fresh key pair and nonce; commit to mac_nonce before seeing pc_nonce.
+    private, mac_pub = new_ephemeral()
+    mac_nonce = os.urandom(PAIR_NONCE_LEN)
+    if args.invalid_point:
+        mac_pub = INVALID_POINT
+        log("negative test: PairCommit carries a public key that is not on P-256")
+    commit = commitment(mac_nonce, mac_pub, pc_pub)
+    if args.bad_commit:
+        commit = commitment(os.urandom(PAIR_NONCE_LEN), mac_pub, pc_pub)
+        log("negative test: commit does not match the mac_nonce that will be sent")
+    pair_commit = PAIR_MAGIC + mac_pub + encode_name(args.name) + commit
+    conn.sendall(pair_commit)
+
+    # PcNonce, and only then MacNonce (spec 2.2).
+    pc_nonce = recv_exact(conn, PAIR_NONCE_LEN, setup_deadline)
+    conn.sendall(mac_nonce)
+
+    keys = pairing_keys(ecdh(private, peer), pair_hello, pair_commit, pc_nonce, mac_nonce)
+    out(f"SAS {keys.sas:06d}")
+    log(f"the Mac would show {format_sas(keys.sas)}")
+
+    if args.confirm == "no":  # the user clicked Cancel
+        out("CANCELLED")
+        conn.close()
+        return EXIT_OK
+
+    # The user clicked Confirm: send MacConfirm, then wait for the PC's.
+    mac_confirm = keys.mac_confirm
+    if args.corrupt_confirm:
+        mac_confirm = flip_first_bit(mac_confirm)
+        log("negative test: sent a wrong MacConfirm")
+    conn.sendall(mac_confirm)
+    pc_confirm = recv_exact(conn, CONFIRM_LEN, time.monotonic() + PAIR_CONFIRM_TIMEOUT)
+    if not hmac.compare_digest(pc_confirm, keys.pc_confirm):
+        raise PairingError("PcConfirm mismatch")
+
+    # Spec 2.4: own user confirmed and the peer's confirm verified -> store ltk.
+    out(f"PAIRED {keys.ltk.hex()}")
+    graceful_close(conn)
+    return EXIT_OK
+
+
+def run_pair_client(args: argparse.Namespace) -> int:
+    try:
+        sock = socket.create_connection((args.host, args.port), timeout=PAIR_SETUP_TIMEOUT)
+    except OSError as exc:
+        log(f"Pairing didn't complete: connect to {args.host}:{args.port} failed: {exc}")
+        out("PAIR FAILED")
+        return EXIT_PAIR_FAILED
+    connected_at = time.monotonic()
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    return run_pairing(sock, lambda: pair_initiator(sock, connected_at, args))
+
+
+def pair_initiator(sock: socket.socket, connected_at: float, args: argparse.Namespace) -> int:
+    """The PC's side of spec 2.2-2.4."""
+    setup_deadline = connected_at + PAIR_SETUP_TIMEOUT
+    reject_timeout = PAIR_SETUP_TIMEOUT + 3.0
+
+    # PairHello.
+    private, pc_pub = new_ephemeral()
+    if args.invalid_point:
+        pc_pub = INVALID_POINT
+    pair_hello = PAIR_MAGIC + pc_pub + encode_name(args.name)
+    sock.sendall(pair_hello)
+    if args.invalid_point:
+        return expect_silent_close(sock, reject_timeout, "invalid pc_pub")
+
+    # PairCommit.
+    pair_commit = recv_exact(sock, PAIR_COMMIT_LEN, setup_deadline)
+    magic = pair_commit[0:4]
+    mac_pub = pair_commit[4 : 4 + PUBKEY_LEN]
+    mac_name = pair_commit[4 + PUBKEY_LEN : 4 + PUBKEY_LEN + NAME_LEN]
+    commit = pair_commit[4 + PUBKEY_LEN + NAME_LEN :]
+    if magic != PAIR_MAGIC:
+        raise PairingError(f"bad magic {magic!r}")
+    try:
+        peer = parse_public_key(mac_pub)
+    except ValueError as exc:
+        raise PairingError(f"invalid mac_pub: {exc}") from None
+    log(f"Mac name: {decode_name(mac_name)!r}")
+
+    if args.withhold_nonce:
+        # The responder must not reveal mac_nonce before it has pc_nonce, and must
+        # give up 10 s after the connection was made.
+        return expect_silent_close(sock, reject_timeout, "withheld PcNonce")
+
+    # PcNonce only after PairCommit has arrived, so the commitment is fixed before
+    # the responder can see pc_nonce. Then MacNonce, and check the commitment.
+    pc_nonce = os.urandom(PAIR_NONCE_LEN)
+    sock.sendall(pc_nonce)
+    mac_nonce = recv_exact(sock, PAIR_NONCE_LEN, setup_deadline)
+    if not hmac.compare_digest(commit, commitment(mac_nonce, mac_pub, pc_pub)):
+        raise PairingError("commit does not match mac_nonce")
+
+    keys = pairing_keys(ecdh(private, peer), pair_hello, pair_commit, pc_nonce, mac_nonce)
+    out(f"SAS {keys.sas:06d}")
+    log(f"the PC would show {format_sas(keys.sas)}")
+
+    if args.confirm == "no":  # the user clicked Cancel
+        out("CANCELLED")
+        sock.close()
+        return EXIT_OK
+
+    # The user clicked Confirm: send PcConfirm, then wait for the Mac's.
+    pc_confirm = keys.pc_confirm
+    if args.corrupt_confirm:
+        pc_confirm = flip_first_bit(pc_confirm)
+        log("negative test: sent a wrong PcConfirm")
+    sock.sendall(pc_confirm)
+    mac_confirm = recv_exact(sock, CONFIRM_LEN, time.monotonic() + PAIR_CONFIRM_TIMEOUT)
+    if not hmac.compare_digest(mac_confirm, keys.mac_confirm):
+        raise PairingError("MacConfirm mismatch")
+
+    out(f"PAIRED {keys.ltk.hex()}")
+    graceful_close(sock)
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 
 class Parser(argparse.ArgumentParser):
-    def error(self, message: str):  # exit 64, never 2 (2 means "handshake failed")
+    def error(self, message: str):  # exit 64, never 2 (2 means "handshake/pairing failed")
         self.print_usage(sys.stderr)
         self.exit(EXIT_USAGE, f"{self.prog}: error: {message}\n")
 
@@ -641,7 +911,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     server = roles.add_parser("server", help="Appendix A.1 selftest server")
     server.add_argument("--port", type=int, default=DEFAULT_PORT)
-    server.add_argument("--code", required=True)
+    server.add_argument("--psk", type=parse_psk, required=True, help="session key, 64 hex digits")
     bad = server.add_mutually_exclusive_group()
     bad.add_argument("--tamper-record", action="store_true", help="flip a bit in the first KEY record")
     bad.add_argument("--replay-record", action="store_true", help="send the first KEY record twice")
@@ -649,7 +919,7 @@ def build_parser() -> argparse.ArgumentParser:
     client = roles.add_parser("client", help="Appendix A.2 selftest client")
     client.add_argument("--host", default="127.0.0.1")
     client.add_argument("--port", type=int, default=DEFAULT_PORT)
-    client.add_argument("--code", required=True)
+    client.add_argument("--psk", type=parse_psk, required=True, help="session key, 64 hex digits")
     client.add_argument(
         "--reject-timeout",
         type=float,
@@ -661,21 +931,41 @@ def build_parser() -> argparse.ArgumentParser:
     neg.add_argument("--bad-magic", action="store_true", help="send a ClientHello with the wrong magic")
     neg.add_argument("--invalid-point", action="store_true", help="send a public key that is not on P-256")
     neg.add_argument("--stall", action="store_true", help="never send ClientFinished")
+
+    pair_server = roles.add_parser("pair-server", help="Appendix A.3 pairing responder")
+    pair_server.add_argument("--port", type=int, default=DEFAULT_PORT)
+    pair_server.add_argument("--name", required=True, help="display name sent to the peer")
+    pair_server.add_argument("--confirm", choices=["yes", "no"], default="yes")
+    neg = pair_server.add_mutually_exclusive_group()
+    neg.add_argument("--bad-commit", action="store_true", help="send a commit that does not match mac_nonce")
+    neg.add_argument("--corrupt-confirm", action="store_true", help="send a wrong MacConfirm")
+    neg.add_argument("--invalid-point", action="store_true", help="send a mac_pub that is not on P-256")
+
+    pair_client = roles.add_parser("pair-client", help="Appendix A.4 pairing initiator")
+    pair_client.add_argument("--host", default="127.0.0.1")
+    pair_client.add_argument("--port", type=int, default=DEFAULT_PORT)
+    pair_client.add_argument("--name", required=True, help="display name sent to the peer")
+    pair_client.add_argument("--confirm", choices=["yes", "no"], default="yes")
+    neg = pair_client.add_mutually_exclusive_group()
+    neg.add_argument("--corrupt-confirm", action="store_true", help="send a wrong PcConfirm")
+    neg.add_argument("--invalid-point", action="store_true", help="send a pc_pub that is not on P-256")
+    neg.add_argument("--withhold-nonce", action="store_true", help="never send PcNonce")
     return parser
+
+
+ROLES = {
+    "server": run_server,
+    "client": run_client,
+    "pair-server": run_pair_server,
+    "pair-client": run_pair_client,
+}
 
 
 def main(argv: list[str] | None = None) -> int:
     global DEBUG
     args = build_parser().parse_args(argv)
     DEBUG = args.debug
-    try:
-        normalize_code(args.code)
-    except InvalidCode as exc:
-        log(f"invalid pairing code: {exc}")
-        return EXIT_USAGE
-    if args.role == "server":
-        return run_server(args)
-    return run_client(args)
+    return ROLES[args.role](args)
 
 
 if __name__ == "__main__":

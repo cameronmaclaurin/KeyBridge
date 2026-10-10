@@ -6,23 +6,10 @@
 #include <string.h>
 
 /* ------------------------------------------------------------------------ */
-/* Pairing code (docs/PROTOCOL.md section 2)                                */
+/* Whitespace                                                               */
 /* ------------------------------------------------------------------------ */
 
-static const char kb_alphabet[] = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-
-static int kb_in_alphabet(wchar_t c)
-{
-    size_t i;
-    for (i = 0; i < sizeof(kb_alphabet) - 1; i++) {
-        if ((wchar_t)(unsigned char)kb_alphabet[i] == c)
-            return 1;
-    }
-    return 0;
-}
-
-/* The characters Python's str.isspace() accepts (the reference implementation
- * uses it), so both sides agree on what "all whitespace" means. */
+/* The characters Python's str.isspace() accepts. */
 static int kb_is_space(wchar_t c)
 {
     unsigned long u = (unsigned long)c;
@@ -35,69 +22,6 @@ static int kb_is_space(wchar_t c)
     if (u == 0x2028 || u == 0x2029 || u == 0x202F || u == 0x205F || u == 0x3000)
         return 1;
     return 0;
-}
-
-static void kb_wipe(void *p, size_t n)
-{
-    volatile unsigned char *v = (volatile unsigned char *)p;
-    while (n--)
-        *v++ = 0;
-}
-
-int kb_normalize_code(const wchar_t *in, char out[KB_CODE_LEN + 1])
-{
-    size_t n = 0;
-
-    if (in == NULL)
-        goto invalid;
-
-    for (; *in != 0; in++) {
-        wchar_t c = *in;
-
-        /* 2. Remove '-' and all whitespace. */
-        if (c == L'-' || kb_is_space(c))
-            continue;
-
-        /* 1. Uppercase. Only ASCII letters can end up valid; U+0131 and
-         *    U+017F are the two non-ASCII letters whose uppercase is ASCII. */
-        if (c >= L'a' && c <= L'z')
-            c = (wchar_t)(c - (L'a' - L'A'));
-        else if ((unsigned long)c == 0x0131)
-            c = L'I';
-        else if ((unsigned long)c == 0x017F)
-            c = L'S';
-
-        /* 3. O -> 0, I -> 1, L -> 1. */
-        if (c == L'O')
-            c = L'0';
-        else if (c == L'I' || c == L'L')
-            c = L'1';
-
-        /* 4. Exactly 20 symbols from the alphabet. */
-        if (!kb_in_alphabet(c) || n >= KB_CODE_LEN)
-            goto invalid;
-        out[n++] = (char)c;
-    }
-
-    if (n != KB_CODE_LEN)
-        goto invalid;
-    out[KB_CODE_LEN] = 0;
-    return 1;
-
-invalid:
-    kb_wipe(out, KB_CODE_LEN + 1);
-    return 0;
-}
-
-void kb_format_code(const char code[KB_CODE_LEN], wchar_t out[KB_CODE_DISPLAY_LEN + 1])
-{
-    size_t i, o = 0;
-    for (i = 0; i < KB_CODE_LEN; i++) {
-        if (i != 0 && i % 5 == 0)
-            out[o++] = L'-';
-        out[o++] = (wchar_t)(unsigned char)code[i];
-    }
-    out[o] = 0;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -346,4 +270,85 @@ int kb_parse_address(const wchar_t *in,
     memcpy(port, p, plen * sizeof(wchar_t));
     port[plen] = 0;
     return 1;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Pairing display helpers (docs/PROTOCOL.md section 2)                     */
+/* ------------------------------------------------------------------------ */
+
+uint32_t kb_sas_from_hash(const uint8_t h[32])
+{
+    uint32_t v = ((uint32_t)h[0] << 24) | ((uint32_t)h[1] << 16) |
+                 ((uint32_t)h[2] << 8) | (uint32_t)h[3];
+    return v % 1000000u;
+}
+
+void kb_format_sas(uint32_t sas, wchar_t out[KB_SAS_DISPLAY_LEN + 1])
+{
+    uint32_t v = sas % 1000000u;
+    int i;
+    /* "482 913": digits 0..2, a space, digits 3..5. */
+    for (i = 6; i >= 0; i--) {
+        if (i == 3) {
+            out[i] = L' ';
+            continue;
+        }
+        out[i] = (wchar_t)(L'0' + (wchar_t)(v % 10u));
+        v /= 10u;
+    }
+    out[KB_SAS_DISPLAY_LEN] = 0;
+}
+
+size_t kb_utf8_prefix_len(const char *s, size_t len, size_t max)
+{
+    size_t n;
+    if (len <= max)
+        return len;
+    n = max;
+    /* Step back over continuation bytes (10xxxxxx) so the cut lands on the
+     * first byte of a character, i.e. no character is split. */
+    while (n > 0 && ((unsigned char)s[n] & 0xC0u) == 0x80u)
+        n--;
+    return n;
+}
+
+/* Characters never shown in a peer-supplied name: C0/C1 controls, and the
+ * invisible formatting characters that could make one name look like
+ * another (bidi overrides/isolates, zero-width characters, line and
+ * paragraph separators, BOM). */
+static int kb_is_hidden_char(unsigned long u)
+{
+    if (u < 0x20 || (u >= 0x7F && u <= 0x9F))
+        return 1;
+    if ((u >= 0x200B && u <= 0x200F) || (u >= 0x2028 && u <= 0x202E) ||
+        (u >= 0x2060 && u <= 0x206F) || u == 0xFEFF || u == 0x00AD)
+        return 1;
+    return 0;
+}
+
+size_t kb_sanitize_name(const wchar_t *in, size_t in_len, wchar_t *out, size_t out_cap)
+{
+    size_t i, n = 0, start, end;
+
+    if (out_cap == 0)
+        return 0;
+    for (i = 0; i < in_len && in[i] != 0 && n + 1 < out_cap; i++) {
+        unsigned long u = (unsigned long)in[i];
+        if (kb_is_hidden_char(u))
+            continue;
+        out[n++] = in[i];
+    }
+    out[n] = 0;
+
+    /* Trim surrounding whitespace. */
+    start = 0;
+    end = n;
+    while (start < end && kb_is_space(out[start]))
+        start++;
+    while (end > start && kb_is_space(out[end - 1]))
+        end--;
+    if (start != 0)
+        memmove(out, out + start, (end - start) * sizeof(wchar_t));
+    out[end - start] = 0;
+    return end - start;
 }

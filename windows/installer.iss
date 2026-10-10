@@ -91,7 +91,7 @@ Root: HKCU; Subkey: "Software\{#AppName}"; ValueType: dword; ValueName: "StartAt
 Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
-; Settings: Mac address and the DPAPI-encrypted pairing code.
+; Settings: Mac address and name, and the DPAPI-encrypted pairing key.
 Type: filesandordirs; Name: "{userappdata}\{#AppName}"
 
 [Code]

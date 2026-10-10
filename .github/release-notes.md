@@ -1,6 +1,6 @@
 ## KeyBridge {{VERSION}}
 
-Type on your Windows PC with your Mac's keyboard, over your local network. The Mac and the PC pair with a one-time code, and every keystroke between them is encrypted and authenticated.
+Type on your Windows PC with your Mac's keyboard, over your local network. The PC finds your Mac by name, you pair them by checking that both screens show the same 6-digit number, and every keystroke between them is encrypted and authenticated.
 
 ### macOS (13 Ventura or later, Apple Silicon and Intel)
 
@@ -20,13 +20,14 @@ Open KeyBridge from Applications. When macOS asks, allow **Accessibility** acces
 
 ### Pair the PC with the Mac
 
-1. On the Mac, click KeyBridge in the menu bar, then **Pair a Windows PC…**. This shows the Mac's address and a pairing code like `ABCDE-FGHJK-MNPQR-STVWX`.
-2. On the PC, type that address and code into the KeyBridge setup window. Upper or lower case both work, and the dashes are optional.
-3. Once the PC connects, press **Ctrl + Shift + `** on the Mac to switch between typing on the Mac and typing on the PC.
+1. On the Mac, click KeyBridge in the menu bar, then **Pair a Windows PC…**. Keep the window open while you pair.
+2. On the PC, open the KeyBridge setup window, pick your Mac from the list and click **Pair**. If your Mac isn't listed, type the address shown in the Mac's Pairing window (such as `Your-Mac.local`, or its IP address).
+3. Both screens show a 6-digit number. **Check that the numbers are the same**, then click **Confirm** on the Mac and on the PC. If they're different, click **Cancel**: you may have picked the wrong computer, or another device may be interfering.
+4. Once the PC connects, press **Ctrl + Shift + `** on the Mac to switch between typing on the Mac and typing on the PC.
 
-To pair a different PC or to revoke access, open **Pair a Windows PC…** on the Mac and choose **Generate New Code**. A PC that only knows the old code can't connect again until you enter the new code on it.
+**Upgrading from KeyBridge 1.1 or earlier?** Pairing no longer uses a typed code, so pair once more after updating both computers.
 
-Both computers must be on the same local network.
+Pairing a different PC replaces the old pairing. To revoke access, choose **Forget** on the Mac or the PC. Both computers must be on the same local network.
 
 ### Verify your download
 

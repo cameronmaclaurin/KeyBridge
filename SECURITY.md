@@ -24,33 +24,44 @@ We'll reply as soon as we can, usually within a week, and keep you updated until
 
 ## Threat model
 
+### How pairing works
+
+You pair a PC with the Mac once. The two computers run an ECDH (P-256) key exchange with a commitment, both show the same 6-digit number, and you click **Confirm** on both after checking that the numbers match. Each side then stores a new random 32-byte key: the Mac in its Keychain, the PC encrypted for your Windows account. This is the "Numeric Comparison" method from Bluetooth LE Secure Connections. No secret is ever shown or typed.
+
+KeyBridge 1.1 paired with a typed 20-character code. That method has been removed, and 1.1 pairings stop working after the upgrade: pair once more.
+
 ### What KeyBridge protects
 
-- **Only the PC you paired receives your keystrokes.** Before the Mac sends any keystrokes, the PC must prove that it knows the pairing code. A device that doesn't know the code never gets a keystroke.
-- **Only your paired Mac can type on your PC.** The PC accepts keystrokes only from a Mac that has proved it knows the same pairing code. Another device on your network can't inject keys.
+- **Only the PC you paired receives your keystrokes.** Before the Mac sends any keystrokes, the PC must prove that it holds the key from pairing. A device that doesn't have it never gets a keystroke.
+- **Only your paired Mac can type on your PC.** The PC accepts keystrokes only from a Mac that has proved it holds the same key. Another device on your network can't inject keys.
+- **Pairing resists a man in the middle.** A device on your network that intercepts pairing ends up with two separate connections, and the Mac and the PC then show different numbers. Because of the commitment, it can't choose its values to make the numbers match: each attempt succeeds with a chance of 1 in 1,000,000, and every attempt needs you to click **Confirm** on both computers.
+- **Pairing happens only when you ask.** The Mac accepts a pairing connection only while its Pairing window is open, for at most 3 minutes, and one at a time. The PC pairs only when you click **Pair**. A pairing that is cancelled, times out or fails saves nothing.
 - **Keystrokes are encrypted and tamper-proof on the network.** Every key event is encrypted and authenticated (AES-256-GCM). If anything is changed, replayed, reordered or inserted, the connection is dropped.
-- **Forward secrecy.** Every connection uses new, single-use keys (ECDH on P-256). Someone who records your traffic today can't decrypt it later, even if they learn the pairing code afterwards.
-- **The pairing code can't be guessed.** It is 20 random characters (about 100 bits). Someone who connects to your Mac gets enough to test guesses on their own computer, but there are far too many possible codes for that to work.
-- **Connecting without the code doesn't affect you.** A connection that hasn't proved it knows the code never replaces or interferes with your current session.
+- **Forward secrecy.** Every connection uses new, single-use keys (ECDH on P-256). Someone who records your traffic today can't decrypt it later, even if they steal the pairing key afterwards.
+- **Connecting without the key doesn't affect you.** A connection that hasn't proved it holds the key never replaces or interferes with your current session.
+
+### What you need to do
+
+- **Actually compare the numbers.** The protection against a man in the middle works only if you check that the Mac and the PC show the same number before you click **Confirm**. If they differ, click **Cancel**.
+- **Compare on both real screens.** Look at the number on your Mac and on your PC, side by side. If the Mac shows a pairing request while your PC isn't pairing, or the PC shows a number while your Mac's Pairing window isn't open, click **Cancel**: another device on your network may be trying to pair. The names on the confirmation screens help, but anyone can choose any name.
+- **Close the Pairing window when you're done.** Pairing mode ends on its own after 3 minutes, on success, or when you close the window.
 
 ### What KeyBridge does not protect against
 
-- **A compromised Mac or PC.** If malware or another person controls either computer, they can read what you type there, and they can steal the pairing code. The Mac keeps the code in the Keychain. Windows keeps it encrypted for your Windows account.
+- **Clicking Confirm without comparing.** If someone on your network intercepts pairing and you confirm different numbers anyway, that device can sit between your Mac and your PC and read your keystrokes. The 6-digit number is your protection. It isn't secret, and it's never typed.
+- **Discovery is not trusted.** The list of Macs on the PC comes from Bonjour, and any device on your network can announce itself under any name, including your Mac's. A fake entry is caught the same way as a man in the middle: your real Mac shows no number, or a different one. That's why you compare the number on the PC with the number on **your Mac's own screen**, not just click Confirm on the PC. Security comes only from that comparison, pairing and the encrypted connection.
+- **A compromised Mac or PC.** If malware or another person controls either computer, they can read what you type there, and they can steal the pairing key. The Mac keeps the key in the Keychain. Windows keeps it encrypted for your Windows account.
 - **macOS Secure Input.** When a password field has focus, or another app turns on Secure Input (some terminals and password managers do this), macOS stops KeyBridge from seeing the keyboard. Your typing then goes to the Mac and not the PC until that app releases Secure Input. This is a macOS protection for your passwords and KeyBridge can't override it.
 - **Keystroke timing.** Encryption hides *which* keys you press, but someone watching your network can see that KeyBridge is in use and *when* each key is pressed or released. In theory, timing patterns can reveal something about what you type.
-- **Use beyond your local network.** KeyBridge is designed for computers on the same home or office network. Don't forward port 9876 from the internet to your Mac. Someone on your network can also block or interrupt the connection. They can't read or inject keystrokes, but they can stop KeyBridge from working.
-- **Someone who sees your pairing code.** Anyone who sees the code (over your shoulder or in a screenshot) can pair a PC. Treat it like a password, and change it if it's exposed (see below).
+- **Use beyond your local network.** KeyBridge is designed for computers on the same home or office network. Don't forward port 9876 from the internet to your Mac. Someone on your network can also block or interrupt the connection, or keep pairing from completing. They can't read or inject keystrokes, but they can stop KeyBridge from working.
 - **Unsigned downloads.** Builds that aren't code-signed don't carry a publisher identity that macOS or Windows can check. Before you run one, verify it (see [Verifying a download](#verifying-a-download)).
 
-## Changing (rotating) the pairing code
+## Removing or replacing a pairing
 
-Change the code if it was exposed, or if you've given away, sold or lost a PC that was paired:
+Do this if you've given away, sold or lost a paired PC, or if you think a pairing was confirmed by mistake:
 
-1. On the Mac, click KeyBridge in the menu bar, then **Pair a Windows PC…**.
-2. Click **Generate New Code**.
-3. Enter the new code on each PC you still want to use.
-
-A PC that only knows the old code can no longer connect.
+- **Forget:** on the Mac, click KeyBridge in the menu bar and choose **Forget This PC…**. On the PC, choose **Forget** in the KeyBridge setup window. Forgetting on either side deletes that side's key, and the two can't connect again until you pair them.
+- **Re-pair:** pairing again replaces the old key on both computers. The Mac pairs with one PC at a time, so pairing a new PC also cuts off the old one, and any current session is dropped.
 
 ## Verifying a download
 
@@ -70,4 +81,4 @@ gh attestation verify .\KeyBridge-Windows-Setup.exe --repo cameronmaclaurin/KeyB
 
 ## Protocol details
 
-The wire protocol, KBP2, is specified in [docs/PROTOCOL.md](docs/PROTOCOL.md). It covers the pairing code, the handshake, the key schedule, the encrypted record format and the security properties. The Mac app, the Windows app and the Python reference implementation in [`tests/reference/kbp2.py`](tests/reference/kbp2.py) all follow it. CI checks that the Mac and Windows apps interoperate with the reference, and that the test hooks are not present in shipping builds.
+The wire protocol, KBP2, is specified in [docs/PROTOCOL.md](docs/PROTOCOL.md). It covers Bonjour discovery, numeric-comparison pairing, the handshake, the key schedule, the encrypted record format and the security properties. The Mac app, the Windows app and the Python reference implementation in [`tests/reference/kbp2.py`](tests/reference/kbp2.py) all follow it. CI checks that the Mac and Windows apps interoperate with the reference, and that the test hooks are not present in shipping builds.

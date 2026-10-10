@@ -37,5 +37,9 @@
     <string>© 2026 Cameron MacLaurin</string>
     <key>NSLocalNetworkUsageDescription</key>
     <string>KeyBridge sends your keystrokes to your Windows PC over the local network.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_keybridge._tcp</string>
+    </array>
 </dict>
 </plist>

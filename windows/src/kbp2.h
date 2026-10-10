@@ -20,7 +20,7 @@
 #define KBP2_SH_PREFIX_LEN     101
 #define KBP2_PLAINTEXT_LEN     4
 #define KBP2_RECORD_LEN        20   /* ciphertext(4) || tag(16) */
-#define KBP2_PSK_LEN           32
+#define KBP2_PSK_LEN           32   /* = the ltk from pairing (section 2) */
 
 #define KBP2_HANDSHAKE_MS      5000 /* section 4 */
 #define KBP2_LIVENESS_MS       6000 /* section 6 */
@@ -38,13 +38,15 @@
 typedef enum {
     KBP2_OK = 0,
     KBP2_STOPPED,        /* the caller's stop event was signaled */
+    KBP2_WOKEN,          /* kbp2_read_exact_ex: the wake event was signaled first */
     KBP2_ERR_RESOLVE,    /* host name did not resolve */
     KBP2_ERR_CONNECT,    /* no address accepted the connection */
     KBP2_ERR_IO,         /* socket error */
     KBP2_ERR_CLOSED,     /* peer closed the connection */
     KBP2_ERR_TIMEOUT,    /* nothing arrived in time */
-    KBP2_ERR_PROTOCOL,   /* bad magic or invalid public key */
-    KBP2_ERR_AUTH,       /* server_finished mismatch: pairing code doesn't match */
+    KBP2_ERR_PROTOCOL,   /* bad magic, invalid public key, or unexpected data */
+    KBP2_ERR_AUTH,       /* server_finished mismatch (not paired with this Mac), or a
+                            pairing commit/confirm mismatch */
     KBP2_ERR_RECORD,     /* record failed authentication (tampered/replayed/reordered) */
     KBP2_ERR_CRYPTO      /* CNG failure */
 } kbp2_status;
@@ -62,8 +64,10 @@ typedef struct {
     uint64_t recv_seq;
 } kbp2_session;
 
-/* psk = HMAC-SHA256("KeyBridge v2 pairing", normalized_code). */
-BOOL kbp2_psk_from_code(const char code[KB_CODE_LEN], uint8_t psk[KBP2_PSK_LEN]);
+/* Expand(prk, info) = HMAC-SHA256(key = prk, data = label || extra || 0x01)
+ * (section 3). extra may be NULL/0. */
+BOOL kbp2_expand(const uint8_t prk[32], const char *label, ULONG label_len,
+                 const uint8_t *extra, ULONG extra_len, uint8_t out[32]);
 
 void        kbp2_conn_init(kbp2_conn *c, HANDLE stop);
 /* Resolve host (AF_UNSPEC, so "Name.local", IPv4 and IPv6 all work) and try
@@ -73,6 +77,17 @@ kbp2_status kbp2_connect(kbp2_conn *c, const wchar_t *host, const wchar_t *port,
 /* Graceful close (section 5): shutdown(SD_SEND), discard input until EOF or
  * KBP2_DRAIN_MS, then closesocket. Safe on a closed/never-opened conn. */
 void        kbp2_conn_close(kbp2_conn *c);
+
+/* Exact-length I/O with a hard deadline (GetTickCount64 time); the conn's
+ * stop event aborts either with KBP2_STOPPED. A clean EOF before the first
+ * byte is KBP2_ERR_CLOSED, mid-message it is KBP2_ERR_IO. */
+kbp2_status kbp2_read_exact(kbp2_conn *c, uint8_t *buf, size_t len, ULONGLONG deadline);
+kbp2_status kbp2_write_all(kbp2_conn *c, const uint8_t *buf, size_t len, ULONGLONG deadline);
+/* Like kbp2_read_exact, but resumable: *got bytes are already in buf, and it
+ * returns KBP2_WOKEN (keeping *got) if wake (optional event) is signaled while
+ * no data is available. Call again with the same buf/got to continue. */
+kbp2_status kbp2_read_exact_ex(kbp2_conn *c, uint8_t *buf, size_t len, size_t *got,
+                               ULONGLONG deadline, HANDLE wake);
 
 /* Client handshake (section 4). On KBP2_OK the session is authenticated and
  * owns two key handles (release with kbp2_session_free). */

@@ -1,8 +1,12 @@
 /*
  * KeyBridge - settings storage (see config.h).
  *
- * config.bin = CryptProtectData(plain), plain =
- *     "KBC1" || host_chars (uint16 LE) || host (UTF-16LE) || code (20 ASCII)
+ * config.bin = CryptProtectData(plain, entropy "KeyBridge config v2"), plain =
+ *     "KBC2" || host_chars (uint16 LE) || host (UTF-16LE)
+ *            || name_chars (uint16 LE) || mac_name (UTF-16LE) || ltk (32)
+ *
+ * v1.1 wrote "KBC1" (a typed pairing code) with entropy "KeyBridge config
+ * v1"; that no longer decrypts or parses, so a v1.1 user simply pairs again.
  */
 #include "config.h"
 
@@ -19,10 +23,10 @@
 #define KB_CONFIG_TMP     L"config.bin.tmp"
 #define KB_CONFIG_MAX     65536
 
-static const BYTE kMagic[4] = { 'K', 'B', 'C', '1' };
-static const char kEntropy[] = "KeyBridge config v1";
+static const BYTE kMagic[4] = { 'K', 'B', 'C', '2' };
+static const char kEntropy[] = "KeyBridge config v2";
 
-#define PLAIN_MAX (4 + 2 + KB_HOST_MAX * 2 + KB_CODE_LEN)
+#define PLAIN_MAX (4 + 2 + KB_HOST_MAX * 2 + 2 + KB_NAME_MAX * 2 + KB_LTK_LEN)
 
 void config_wipe(kb_config *cfg)
 {
@@ -53,38 +57,49 @@ static void entropy_blob(DATA_BLOB *b)
     b->cbData = (DWORD)(sizeof(kEntropy) - 1);
 }
 
+/* Read a uint16-LE length-prefixed UTF-16LE string at p[*off]. */
+static BOOL read_string(const BYTE *p, DWORD n, DWORD *off, wchar_t *out, DWORD max_chars,
+                        BOOL allow_empty)
+{
+    DWORD len, i;
+
+    if (n - *off < 2)
+        return FALSE;
+    len = (DWORD)p[*off] | ((DWORD)p[*off + 1] << 8);
+    *off += 2;
+    if ((len == 0 && !allow_empty) || len > max_chars || n - *off < len * 2)
+        return FALSE;
+    for (i = 0; i < len; i++)
+        out[i] = (wchar_t)((DWORD)p[*off + 2 * i] | ((DWORD)p[*off + 2 * i + 1] << 8));
+    out[len] = 0;
+    *off += len * 2;
+    return wcslen(out) == len; /* no embedded NULs */
+}
+
+static void write_string(BYTE *p, DWORD *off, const wchar_t *s, size_t len)
+{
+    size_t i;
+    p[(*off)++] = (BYTE)(len & 0xFF);
+    p[(*off)++] = (BYTE)((len >> 8) & 0xFF);
+    for (i = 0; i < len; i++) {
+        p[(*off)++] = (BYTE)(s[i] & 0xFF);
+        p[(*off)++] = (BYTE)((s[i] >> 8) & 0xFF);
+    }
+}
+
 static BOOL parse_plain(const BYTE *p, DWORD n, kb_config *cfg)
 {
-    wchar_t wcode[KB_CODE_LEN + 1];
-    char code[KB_CODE_LEN + 1];
-    DWORD hlen, i;
-    const BYTE *cp;
-    BOOL ok = FALSE;
+    DWORD off = 4;
 
-    if (n < 6 || memcmp(p, kMagic, sizeof(kMagic)) != 0)
+    if (n < 4 || memcmp(p, kMagic, sizeof(kMagic)) != 0)
         return FALSE;
-    hlen = (DWORD)p[4] | ((DWORD)p[5] << 8);
-    if (hlen == 0 || hlen > KB_HOST_MAX || n != 6 + hlen * 2 + KB_CODE_LEN)
+    if (!read_string(p, n, &off, cfg->host, KB_HOST_MAX, FALSE) ||
+        !read_string(p, n, &off, cfg->mac_name, KB_NAME_MAX, TRUE))
         return FALSE;
-
-    for (i = 0; i < hlen; i++)
-        cfg->host[i] = (wchar_t)((DWORD)p[6 + 2 * i] | ((DWORD)p[7 + 2 * i] << 8));
-    cfg->host[hlen] = 0;
-    if (wcslen(cfg->host) != hlen)
+    if (n - off != KB_LTK_LEN)
         return FALSE;
-
-    cp = p + 6 + hlen * 2;
-    for (i = 0; i < KB_CODE_LEN; i++)
-        wcode[i] = (wchar_t)cp[i];
-    wcode[KB_CODE_LEN] = 0;
-    /* Stored codes are already normalized; anything else is corrupt. */
-    if (kb_normalize_code(wcode, code) && memcmp(code, cp, KB_CODE_LEN) == 0) {
-        memcpy(cfg->code, code, sizeof(cfg->code));
-        ok = TRUE;
-    }
-    SecureZeroMemory(wcode, sizeof(wcode));
-    SecureZeroMemory(code, sizeof(code));
-    return ok;
+    memcpy(cfg->ltk, p + off, KB_LTK_LEN);
+    return TRUE;
 }
 
 BOOL config_load(kb_config *cfg)
@@ -141,25 +156,22 @@ BOOL config_save(const kb_config *cfg)
     wchar_t path[MAX_PATH], tmp[MAX_PATH];
     DATA_BLOB in, out, ent;
     size_t hlen = wcslen(cfg->host);
-    size_t i;
-    DWORD n, written = 0;
+    size_t nlen = wcslen(cfg->mac_name);
+    DWORD n = 0, written = 0;
     HANDLE f;
     BOOL ok = FALSE;
 
     out.pbData = NULL;
     out.cbData = 0;
-    if (hlen == 0 || hlen > KB_HOST_MAX || strlen(cfg->code) != KB_CODE_LEN)
+    if (hlen == 0 || hlen > KB_HOST_MAX || nlen > KB_NAME_MAX)
         return FALSE;
 
     memcpy(plain, kMagic, sizeof(kMagic));
-    plain[4] = (BYTE)(hlen & 0xFF);
-    plain[5] = (BYTE)((hlen >> 8) & 0xFF);
-    for (i = 0; i < hlen; i++) {
-        plain[6 + 2 * i] = (BYTE)(cfg->host[i] & 0xFF);
-        plain[7 + 2 * i] = (BYTE)((cfg->host[i] >> 8) & 0xFF);
-    }
-    memcpy(plain + 6 + hlen * 2, cfg->code, KB_CODE_LEN);
-    n = (DWORD)(6 + hlen * 2 + KB_CODE_LEN);
+    n = (DWORD)sizeof(kMagic);
+    write_string(plain, &n, cfg->host, hlen);
+    write_string(plain, &n, cfg->mac_name, nlen);
+    memcpy(plain + n, cfg->ltk, KB_LTK_LEN);
+    n += KB_LTK_LEN;
 
     in.pbData = plain;
     in.cbData = n;
@@ -188,6 +200,21 @@ done:
     if (out.pbData != NULL)
         LocalFree(out.pbData);
     return ok;
+}
+
+BOOL config_delete(void)
+{
+    wchar_t path[MAX_PATH], tmp[MAX_PATH];
+
+    if (!config_path(path, KB_CONFIG_FILE, FALSE))
+        return FALSE;
+    if (config_path(tmp, KB_CONFIG_TMP, FALSE))
+        (void)DeleteFileW(tmp);
+    if (!DeleteFileW(path)) {
+        DWORD err = GetLastError();
+        return err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND;
+    }
+    return TRUE;
 }
 
 /* ------------------------------------------------------------------------ */

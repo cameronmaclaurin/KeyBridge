@@ -18,27 +18,40 @@ IDI_TRAY_OFF    ICON    "../assets/tray-off.ico"
 // (CREATEPROCESS_MANIFEST_RESOURCE_ID). The linker runs with /MANIFEST:NO.
 1 24 "keybridge.manifest"
 
-IDD_SETTINGS DIALOGEX 0, 0, 292, 172
+// Setup: pick a Mac found on the network (or type an address), then Pair.
+// If the DNS-SD APIs are missing, main.c hides the list and moves the
+// manual-entry controls up.
+IDD_SETUP DIALOGEX 0, 0, 262, 226
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 EXSTYLE WS_EX_APPWINDOW
-CAPTION "KeyBridge Settings"
+CAPTION "Pair with your Mac"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
-    LTEXT           "Connect this PC to your Mac so you can type on it with your Mac’s keyboard.", IDC_INTRO, 10, 8, 272, 10
-    LTEXT           "To find the address and pairing code, click the KeyBridge icon in your Mac’s menu bar and choose “Pair a Windows PC…”.", IDC_STATIC, 10, 22, 272, 18
+    LTEXT           "On your Mac, click the KeyBridge menu bar icon → Pair a Windows PC…", IDC_HELP_TEXT, 10, 8, 242, 18
+    LTEXT           "&Macs on your network:", IDC_LIST_LABEL, 10, 30, 242, 8
+    LISTBOX         IDC_MAC_LIST, 10, 41, 242, 64, LBS_NOTIFY | LBS_SORT | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "&Or enter the address manually:", IDC_MANUAL_LABEL, 10, 113, 242, 8
+    EDITTEXT        IDC_HOST, 10, 124, 242, 14, ES_AUTOHSCROLL
+    LTEXT           "For example Camerons-MacBook.local, 192.168.1.20 or host:port", IDC_HOST_HINT, 10, 140, 242, 8
+    AUTOCHECKBOX    "&Start KeyBridge when I sign in", IDC_AUTOSTART, 10, 158, 242, 10
+    LTEXT           "", IDC_SETUP_STATUS, 10, 174, 242, 24, SS_NOPREFIX
+    DEFPUSHBUTTON   "&Pair", IDOK, 148, 204, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 202, 204, 50, 14
+END
 
-    LTEXT           "&Mac address:", IDC_STATIC, 10, 52, 64, 8
-    EDITTEXT        IDC_HOST, 78, 50, 204, 14, ES_AUTOHSCROLL
-    LTEXT           "For example Camerons-MacBook.local or 192.168.1.20", IDC_HOST_HINT, 78, 66, 204, 8
-
-    LTEXT           "&Pairing code:", IDC_STATIC, 10, 86, 64, 8
-    EDITTEXT        IDC_CODE, 78, 84, 204, 14, ES_AUTOHSCROLL | ES_UPPERCASE
-    LTEXT           "20 letters and numbers, like ABCDE-FGHJK-MNPQR-STVWX", IDC_CODE_HINT, 78, 100, 204, 8
-
-    AUTOCHECKBOX    "&Start KeyBridge when I sign in", IDC_AUTOSTART, 10, 120, 272, 10
-
-    DEFPUSHBUTTON   "Connect", IDOK, 178, 148, 50, 14
-    PUSHBUTTON      "Cancel", IDCANCEL, 232, 148, 50, 14
+// Compare: both screens must show the same number. Confirm is not IDOK
+// and not the default button, so Enter can't confirm without looking.
+IDD_COMPARE DIALOGEX 0, 0, 230, 134
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Pair with your Mac"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_CMP_TITLE, 10, 10, 210, 10, SS_NOPREFIX | SS_ENDELLIPSIS
+    LTEXT           "Make sure your Mac shows the same number.", IDC_CMP_HINT, 10, 24, 210, 10
+    CTEXT           "", IDC_CMP_NUMBER, 10, 40, 210, 34, SS_NOPREFIX | SS_CENTERIMAGE
+    CTEXT           "", IDC_CMP_STATUS, 10, 82, 210, 10, SS_NOPREFIX
+    PUSHBUTTON      "&Confirm", IDC_CMP_CONFIRM, 116, 110, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 170, 110, 50, 14
 END
 
 VS_VERSION_INFO VERSIONINFO

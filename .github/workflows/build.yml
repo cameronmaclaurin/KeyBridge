@@ -246,6 +246,15 @@ jobs:
         shell: pwsh
         run: python tests\interop\test_windows_client.py windows\build\KeyBridge-selftest.exe
 
+      # python-zeroconf advertises a _keybridge._tcp instance; the selftest build
+      # must find it (PROTOCOL.md 1a, A.5). Retries once; reports SKIPPED with a
+      # warning annotation (not a pass) only if this runner has no working mDNS
+      # multicast loopback at all.
+      - name: Discovery test (Windows selftest browse vs python-zeroconf)
+        shell: pwsh
+        timeout-minutes: 5
+        run: python tests\interop\test_windows_discovery.py windows\build\KeyBridge-selftest.exe
+
       - name: Build KeyBridge.exe (MSVC)
         shell: cmd
         run: |

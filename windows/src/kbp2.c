@@ -12,7 +12,6 @@
 #endif
 
 /* Labels (ASCII, no terminator on the wire). */
-static const char kLabelPairing[]        = "KeyBridge v2 pairing";
 static const char kLabelServerFinished[] = "KBR2 server finished";
 static const char kLabelClientFinished[] = "KBR2 client finished";
 static const char kLabelTrafficS2C[]     = "KBR2 traffic s2c";
@@ -23,13 +22,8 @@ static const char kLabelTrafficC2S[]     = "KBR2 traffic c2s";
 /* Key schedule helpers (section 3)                                         */
 /* ------------------------------------------------------------------------ */
 
-BOOL kbp2_psk_from_code(const char code[KB_CODE_LEN], uint8_t psk[KBP2_PSK_LEN])
-{
-    return kb_hmac_sha256(LABEL(kLabelPairing), code, KB_CODE_LEN, NULL, 0, NULL, 0, psk);
-}
-
 /* Expand(prk, info) = HMAC-SHA256(prk, info || 0x01) with info = label || extra. */
-static BOOL kbp2_expand(const uint8_t prk[KB_SHA256_LEN], const char *label, ULONG label_len,
+BOOL kbp2_expand(const uint8_t prk[KB_SHA256_LEN], const char *label, ULONG label_len,
                         const uint8_t *extra, ULONG extra_len, uint8_t out[KB_SHA256_LEN])
 {
     static const uint8_t one = 0x01;
@@ -58,13 +52,14 @@ static kbp2_status error_status(int wsa_error)
     }
 }
 
-/* Wait for socket activity, the stop event (if honor_stop), or the deadline.
- * Resets the socket's event via WSAEnumNetworkEvents. */
-static kbp2_status conn_wait(kbp2_conn *c, ULONGLONG deadline, BOOL honor_stop,
+/* Wait for socket activity, the stop event (if honor_stop), the optional wake
+ * event, or the deadline. Resets the socket's event via WSAEnumNetworkEvents.
+ * Returns KBP2_WOKEN if wake was signaled. */
+static kbp2_status conn_wait(kbp2_conn *c, ULONGLONG deadline, BOOL honor_stop, HANDLE wake,
                              WSANETWORKEVENTS *ne)
 {
-    HANDLE handles[2];
-    DWORD count = 0, ms, r;
+    HANDLE handles[3];
+    DWORD count = 0, ms, r, wake_index = MAXDWORD;
     BOOL with_stop = honor_stop && c->stop != NULL;
     ULONGLONG now = GetTickCount64();
 
@@ -74,7 +69,11 @@ static kbp2_status conn_wait(kbp2_conn *c, ULONGLONG deadline, BOOL honor_stop,
     ms = (deadline - now > 0x7FFFFFFFull) ? 0x7FFFFFFFul : (DWORD)(deadline - now);
 
     if (with_stop)
-        handles[count++] = c->stop; /* first, so it wins when both are signaled */
+        handles[count++] = c->stop; /* first, so it wins when several are signaled */
+    if (wake != NULL) {
+        wake_index = count;
+        handles[count++] = wake;
+    }
     handles[count++] = c->event;
 
     r = WaitForMultipleObjects(count, handles, FALSE, ms);
@@ -84,44 +83,54 @@ static kbp2_status conn_wait(kbp2_conn *c, ULONGLONG deadline, BOOL honor_stop,
         return KBP2_ERR_IO;
     if (with_stop && r == WAIT_OBJECT_0)
         return KBP2_STOPPED;
+    if (r - WAIT_OBJECT_0 == wake_index)
+        return KBP2_WOKEN;
     if (WSAEnumNetworkEvents(c->sock, c->event, ne) == SOCKET_ERROR)
         return KBP2_ERR_IO;
     return KBP2_OK;
 }
 
-static kbp2_status read_exact(kbp2_conn *c, uint8_t *buf, size_t len, ULONGLONG deadline)
+kbp2_status kbp2_read_exact_ex(kbp2_conn *c, uint8_t *buf, size_t len, size_t *got,
+                               ULONGLONG deadline, HANDLE wake)
 {
-    size_t got = 0;
-
-    while (got < len) {
+    while (*got < len) {
         WSANETWORKEVENTS ne;
         kbp2_status st;
         int r, err;
 
         if (stop_signaled(c))
             return KBP2_STOPPED;
-        r = recv(c->sock, (char *)buf + got, (int)(len - got), 0);
+        if (c->sock == INVALID_SOCKET)
+            return KBP2_ERR_IO;
+        r = recv(c->sock, (char *)buf + *got, (int)(len - *got), 0);
         if (r > 0) {
-            got += (size_t)r;
+            *got += (size_t)r;
             continue;
         }
         /* A close on a message boundary is a clean close; a close in the
          * middle of a message is a truncated message, i.e. an error. */
         if (r == 0)
-            return got == 0 ? KBP2_ERR_CLOSED : KBP2_ERR_IO;
+            return *got == 0 ? KBP2_ERR_CLOSED : KBP2_ERR_IO;
         err = WSAGetLastError();
         if (err != WSAEWOULDBLOCK) {
             st = error_status(err);
-            return (st == KBP2_ERR_CLOSED && got != 0) ? KBP2_ERR_IO : st;
+            return (st == KBP2_ERR_CLOSED && *got != 0) ? KBP2_ERR_IO : st;
         }
-        st = conn_wait(c, deadline, TRUE, &ne);
+        /* Data already received always wins over the wake event. */
+        st = conn_wait(c, deadline, TRUE, wake, &ne);
         if (st != KBP2_OK)
             return st;
     }
     return KBP2_OK;
 }
 
-static kbp2_status write_all(kbp2_conn *c, const uint8_t *buf, size_t len, ULONGLONG deadline)
+kbp2_status kbp2_read_exact(kbp2_conn *c, uint8_t *buf, size_t len, ULONGLONG deadline)
+{
+    size_t got = 0;
+    return kbp2_read_exact_ex(c, buf, len, &got, deadline, NULL);
+}
+
+kbp2_status kbp2_write_all(kbp2_conn *c, const uint8_t *buf, size_t len, ULONGLONG deadline)
 {
     size_t sent = 0;
 
@@ -132,6 +141,8 @@ static kbp2_status write_all(kbp2_conn *c, const uint8_t *buf, size_t len, ULONG
 
         if (stop_signaled(c))
             return KBP2_STOPPED;
+        if (c->sock == INVALID_SOCKET)
+            return KBP2_ERR_IO;
         r = send(c->sock, (const char *)buf + sent, (int)(len - sent), 0);
         if (r > 0) {
             sent += (size_t)r;
@@ -140,7 +151,7 @@ static kbp2_status write_all(kbp2_conn *c, const uint8_t *buf, size_t len, ULONG
         err = (r == 0) ? WSAECONNRESET : WSAGetLastError();
         if (err != WSAEWOULDBLOCK)
             return error_status(err);
-        st = conn_wait(c, deadline, TRUE, &ne); /* FD_WRITE re-arms after WSAEWOULDBLOCK */
+        st = conn_wait(c, deadline, TRUE, NULL, &ne); /* FD_WRITE re-arms after WSAEWOULDBLOCK */
         if (st != KBP2_OK)
             return st;
     }
@@ -229,7 +240,7 @@ kbp2_status kbp2_connect(kbp2_conn *c, const wchar_t *host, const wchar_t *port,
         deadline = GetTickCount64() + per_address_timeout_ms;
         for (;;) {
             WSANETWORKEVENTS ne;
-            st = conn_wait(c, deadline, TRUE, &ne);
+            st = conn_wait(c, deadline, TRUE, NULL, &ne);
             if (st != KBP2_OK)
                 break;
             if (ne.lNetworkEvents & FD_CONNECT) {
@@ -274,7 +285,7 @@ void kbp2_conn_close(kbp2_conn *c)
                     continue;
                 if (r == 0 || WSAGetLastError() != WSAEWOULDBLOCK)
                     break;
-                if (conn_wait(c, deadline, TRUE, &ne) != KBP2_OK)
+                if (conn_wait(c, deadline, TRUE, NULL, &ne) != KBP2_OK)
                     break;
             }
             SecureZeroMemory(junk, sizeof(junk));
@@ -320,12 +331,12 @@ kbp2_status kbp2_client_handshake(kbp2_conn *c, const uint8_t psk[KBP2_PSK_LEN],
         st = KBP2_ERR_CRYPTO;
         goto done;
     }
-    st = write_all(c, ch, sizeof(ch), deadline);
+    st = kbp2_write_all(c, ch, sizeof(ch), deadline);
     if (st != KBP2_OK)
         goto done;
 
     /* 2. Read exactly 133 bytes within the 5 s window; check magic and key. */
-    st = read_exact(c, sh, sizeof(sh), deadline);
+    st = kbp2_read_exact(c, sh, sizeof(sh), deadline);
     if (st != KBP2_OK)
         goto done;
     if (memcmp(sh, KBP2_MAGIC, KBP2_MAGIC_LEN) != 0 || !kb_p256_point_valid(server_pub)) {
@@ -359,7 +370,8 @@ kbp2_status kbp2_client_handshake(kbp2_conn *c, const uint8_t psk[KBP2_PSK_LEN],
         goto done;
     }
     if (!kb_ct_equal(server_finished, received_finished, KBP2_FINISHED_LEN)) {
-        /* 3. Pairing code doesn't match: close without sending ClientFinished. */
+        /* 3. Not paired with this Mac (different ltk): close without sending
+         *    ClientFinished. */
         st = KBP2_ERR_AUTH;
         goto done;
     }
@@ -382,7 +394,7 @@ kbp2_status kbp2_client_handshake(kbp2_conn *c, const uint8_t psk[KBP2_PSK_LEN],
     }
 
     /* 4. Send ClientFinished (32 bytes); the session is authenticated. */
-    st = write_all(c, client_finished, sizeof(client_finished), deadline);
+    st = kbp2_write_all(c, client_finished, sizeof(client_finished), deadline);
     if (st != KBP2_OK)
         goto done;
     s->send_seq = 0;
@@ -417,7 +429,7 @@ kbp2_status kbp2_send_record(kbp2_conn *c, kbp2_session *s, const uint8_t pt[KBP
     if (!kb_gcm_seal(s->send_key, nonce, pt, KBP2_PLAINTEXT_LEN, record, record + KBP2_PLAINTEXT_LEN))
         return KBP2_ERR_CRYPTO;
     s->send_seq++;
-    return write_all(c, record, sizeof(record), GetTickCount64() + KBP2_SEND_MS);
+    return kbp2_write_all(c, record, sizeof(record), GetTickCount64() + KBP2_SEND_MS);
 }
 
 kbp2_status kbp2_recv_record(kbp2_conn *c, kbp2_session *s, uint8_t pt[KBP2_PLAINTEXT_LEN],
@@ -430,7 +442,7 @@ kbp2_status kbp2_recv_record(kbp2_conn *c, kbp2_session *s, uint8_t pt[KBP2_PLAI
     memset(pt, 0, KBP2_PLAINTEXT_LEN);
     if (s->recv_key == NULL || s->recv_seq == UINT64_MAX)
         return KBP2_ERR_CRYPTO;
-    st = read_exact(c, record, sizeof(record), GetTickCount64() + timeout_ms);
+    st = kbp2_read_exact(c, record, sizeof(record), GetTickCount64() + timeout_ms);
     if (st != KBP2_OK)
         return st;
     kb_record_nonce(s->recv_seq, nonce);
@@ -453,13 +465,14 @@ const char *kbp2_status_text(kbp2_status st)
     switch (st) {
     case KBP2_OK:           return "ok";
     case KBP2_STOPPED:      return "stopped";
+    case KBP2_WOKEN:        return "woken";
     case KBP2_ERR_RESOLVE:  return "could not resolve host name";
     case KBP2_ERR_CONNECT:  return "could not connect";
     case KBP2_ERR_IO:       return "socket error";
     case KBP2_ERR_CLOSED:   return "connection closed by peer";
     case KBP2_ERR_TIMEOUT:  return "timed out";
-    case KBP2_ERR_PROTOCOL: return "protocol error (bad magic or invalid public key)";
-    case KBP2_ERR_AUTH:     return "server_finished mismatch (pairing code doesn't match)";
+    case KBP2_ERR_PROTOCOL: return "protocol error (bad magic, invalid public key or unexpected data)";
+    case KBP2_ERR_AUTH:     return "authentication failed (finished, commit or confirm value mismatch)";
     case KBP2_ERR_RECORD:   return "record failed authentication";
     case KBP2_ERR_CRYPTO:   return "cryptography error";
     }

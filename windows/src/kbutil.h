@@ -1,7 +1,7 @@
 /*
  * KeyBridge - pure C helpers with no Windows dependencies (so they can be
- * unit-tested on any platform): pairing-code normalization, constant-time
- * compare, record nonces, P-256 point validation, address parsing.
+ * unit-tested on any platform): constant-time compare, record nonces, P-256
+ * point validation, address parsing, pairing display helpers.
  */
 #ifndef KB_KBUTIL_H
 #define KB_KBUTIL_H
@@ -10,18 +10,11 @@
 #include <stdint.h>
 #include <wchar.h>
 
-#define KB_CODE_LEN        20   /* normalized pairing code length (docs/PROTOCOL.md section 2) */
-#define KB_CODE_DISPLAY_LEN 23  /* "ABCDE-FGHJK-MNPQR-STVWX" */
 #define KB_HOST_MAX        255  /* max characters accepted for the Mac address field */
 #define KB_PORT_MAX        5    /* "65535" */
 #define KB_NONCE_LEN       12
-
-/* Normalize user input per spec section 2. On success writes 20 symbols plus a
- * NUL terminator to out and returns 1; returns 0 (and wipes out) if invalid. */
-int kb_normalize_code(const wchar_t *in, char out[KB_CODE_LEN + 1]);
-
-/* "ABCDE-FGHJK-MNPQR-STVWX" form of a normalized code. */
-void kb_format_code(const char code[KB_CODE_LEN], wchar_t out[KB_CODE_DISPLAY_LEN + 1]);
+#define KB_NAME_MAX        64   /* display-name characters kept (64 UTF-8 bytes on the wire) */
+#define KB_SAS_DISPLAY_LEN 7    /* "482 913" */
 
 /* 1 if the n bytes at a and b are equal. Runs in time independent of the data. */
 int kb_ct_equal(const void *a, const void *b, size_t n);
@@ -43,5 +36,20 @@ int kb_parse_address(const wchar_t *in,
 
 /* Copy in to out without leading/trailing whitespace. Returns the length. */
 size_t kb_trim_copy(const wchar_t *in, wchar_t *out, size_t out_cap);
+
+/* sas = uint32_be(h[0..4]) mod 1000000, where h = SHA-256("KBPR sas" || TH). */
+uint32_t kb_sas_from_hash(const uint8_t h[32]);
+
+/* "482 913": six digits with leading zeros, a space after the third. */
+void kb_format_sas(uint32_t sas, wchar_t out[KB_SAS_DISPLAY_LEN + 1]);
+
+/* Length of the longest prefix of the UTF-8 string s (len bytes) that is at
+ * most max bytes and does not split a character. */
+size_t kb_utf8_prefix_len(const char *s, size_t len, size_t max);
+
+/* Copy a peer-supplied display name (already decoded to UTF-16, in_len units,
+ * stopping early at a NUL) without control or invisible formatting
+ * characters, trimmed. Returns the output length. */
+size_t kb_sanitize_name(const wchar_t *in, size_t in_len, wchar_t *out, size_t out_cap);
 
 #endif
