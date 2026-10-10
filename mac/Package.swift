@@ -4,12 +4,12 @@ import PackageDescription
 let package = Package(
     name: "KeyBridge",
     platforms: [.macOS(.v13)],
-    swiftLanguageVersions: [.v5],
     targets: [
         .executableTarget(
             name: "KeyBridge",
             path: "Sources/KeyBridge",
-            resources: [.copy("../../Resources/Info.plist")]
+            resources: [.copy("../../Resources/Info.plist")],
+            swiftSettings: [.unsafeFlags(["-strict-concurrency=minimal"])]
         )
     ]
 )
