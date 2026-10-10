@@ -56,17 +56,31 @@ enum SelfTest {
 
     // MARK: A.1
 
-    /// `KeyBridge --selftest-server --port <P> --psk <64 hex>`
+    /// `KeyBridge --selftest-server --port <P> --psk <64 hex> [--clip-file <path>]`
     /// Exit codes: 0 success, 2 handshake failed, 3 no valid PONG, 1 setup error, 64 usage.
     static func runServer(_ args: [String]) -> Never {
-        let usageText = "KeyBridge --selftest-server --port <P> --psk <64 hex chars>"
+        let usageText = "KeyBridge --selftest-server --port <P> --psk <64 hex chars> [--clip-file <path>]"
         guard let port = parsePort(args), let pskArg = value(args, "--psk"), let psk = parsePSK(pskArg)
         else { usage(usageText) }
 
+        var clip: Data?
+        if args.contains("--clip-file") {
+            guard let path = value(args, "--clip-file") else { usage(usageText) }
+            guard let d = FileManager.default.contents(atPath: path) else {
+                FileHandle.standardError.write(Data("can't read \(path)\n".utf8))
+                exit(1)
+            }
+            clip = d
+        }
+
         let server = KBP2Server(psk: psk, options: loopbackOptions(port: port))
+        server.clipboardEnabled = true  // CAPS b1 = 0x01
 
         var gotPong = false
         var finishing = false
+        var authenticated = false
+        var pinged = false
+        var clipPending = clip != nil
 
         // Send RELEASE_ALL, close gracefully (§5), then exit.
         func finish(_ status: Int32) {
@@ -74,6 +88,31 @@ enum SelfTest {
             finishing = true
             server.sendReleaseAll()
             server.stop { exit(status) }
+        }
+
+        // After the PONG, allow at most 1 s more for a client transfer in progress
+        // (until it completes, is discarded or is abandoned).
+        func finishAfterPong(_ deadline: DispatchTime) {
+            guard server.isReceivingClipboard, DispatchTime.now() < deadline else { finish(0); return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(10)) { finishAfterPong(deadline) }
+        }
+
+        func ping() {
+            guard !pinged else { return }
+            pinged = true
+            server.sendPing()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { finish(3) }
+        }
+
+        // 4a: the transfer goes only to a client whose CAPS had bit0 set, so wait for it
+        // (briefly) before sending; then PING.
+        func sendClipThenPing() {
+            guard authenticated, clipPending else { return }
+            guard server.canSendClipboard, let clip else {
+                return  // no CAPS yet; the availability callback or the fallback timer retries
+            }
+            clipPending = false
+            server.sendClipboardText(clip) { _ in ping() }
         }
 
         server.onListenerEvent = { event in
@@ -90,16 +129,36 @@ enum SelfTest {
             exit(2)
         }
         server.onAuthenticated = { _, _ in
+            // CAPS has already gone out as the first record.
+            authenticated = true
             server.sendKey(isDown: true, isExtended: false, vk: 0x0041)
             server.sendKey(isDown: false, isExtended: false, vk: 0x0041)
             server.sendKey(isDown: true, isExtended: true, vk: 0x000D)
             server.sendKey(isDown: false, isExtended: true, vk: 0x000D)
-            server.sendPing()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { finish(3) }
+            guard clipPending else { ping(); return }
+            sendClipThenPing()
+            // A client that never advertises clipboard support gets no transfer.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                if clipPending { clipPending = false; ping() }
+            }
+        }
+        server.onClipboardAvailabilityChanged = { _ in sendClipThenPing() }
+        server.onPeerCaps = { caps in
+            // A client with sharing off gets no transfer; go straight to PING.
+            if caps & KBP2.capClipboardText == 0, authenticated, clipPending {
+                clipPending = false
+                ping()
+            }
+        }
+        server.onClipboardText = { utf8 in
+            let hex = SHA256.hash(data: utf8).map { String(format: "%02x", $0) }.joined()
+            say("CLIP \(utf8.count) \(hex)")
+            if gotPong { finish(0) }
         }
         server.onPong = {
+            guard !gotPong else { return }
             gotPong = true
-            finish(0)
+            finishAfterPong(.now() + 1)
         }
         // Client closed, or one of its records failed authentication, before a valid PONG.
         server.onSessionEnded = {

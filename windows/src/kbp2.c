@@ -452,6 +452,271 @@ kbp2_status kbp2_recv_record(kbp2_conn *c, kbp2_session *s, uint8_t pt[KBP2_PLAI
     return KBP2_OK;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Session I/O pump (sections 5, 5a, 6)                                     */
+/* ------------------------------------------------------------------------ */
+
+void kbp2_io_init(kbp2_io *io, kbp2_conn *c, kbp2_session *s)
+{
+    io->conn = c;
+    io->sess = s;
+    io->live_deadline = GetTickCount64() + KBP2_LIVENESS_MS;
+    io->send_deadline = 0;
+    io->in_need = KBP2_RECORD_LEN;
+    io->in_got = 0;
+    io->in_chunk = FALSE;
+    io->out_pos = 0;
+    io->out_len = 0;
+}
+
+void kbp2_io_wipe(kbp2_io *io)
+{
+    SecureZeroMemory(io->in, sizeof(io->in));
+    SecureZeroMemory(io->pt, sizeof(io->pt));
+    SecureZeroMemory(io->out, sizeof(io->out));
+    io->in_got = 0;
+    io->out_pos = 0;
+    io->out_len = 0;
+}
+
+BOOL kbp2_io_send_idle(const kbp2_io *io)
+{
+    return io->out_pos >= io->out_len;
+}
+
+/* Hand queued bytes to the socket until it would block. */
+static kbp2_status io_flush(kbp2_io *io)
+{
+    kbp2_conn *c = io->conn;
+
+    while (io->out_pos < io->out_len) {
+        int r, err;
+        size_t n = io->out_len - io->out_pos;
+
+        if (c->sock == INVALID_SOCKET)
+            return KBP2_ERR_IO;
+        r = send(c->sock, (const char *)io->out + io->out_pos, (int)n, 0);
+        if (r > 0) {
+            io->out_pos += (size_t)r;
+            io->send_deadline = GetTickCount64() + KBP2_SEND_MS; /* progress */
+            continue;
+        }
+        err = (r == 0) ? WSAECONNRESET : WSAGetLastError();
+        if (err == WSAEWOULDBLOCK)
+            break; /* FD_WRITE re-arms and wakes conn_wait */
+        return error_status(err);
+    }
+    if (io->out_pos >= io->out_len) {
+        io->out_pos = 0;
+        io->out_len = 0;
+    }
+    return KBP2_OK;
+}
+
+/* Make room for need more bytes at the end of the send queue. */
+static BOOL io_reserve(kbp2_io *io, size_t need)
+{
+    if (io->out_pos >= io->out_len) {
+        io->out_pos = 0;
+        io->out_len = 0;
+    }
+    if (sizeof(io->out) - io->out_len >= need)
+        return TRUE;
+    if (io->out_pos != 0) {
+        memmove(io->out, io->out + io->out_pos, io->out_len - io->out_pos);
+        io->out_len -= io->out_pos;
+        io->out_pos = 0;
+    }
+    return sizeof(io->out) - io->out_len >= need;
+}
+
+/* Seal len bytes of pt with the next send seq into dst (len ciphertext bytes
+ * followed by the 16-byte tag). */
+static kbp2_status io_seal(kbp2_io *io, const uint8_t *pt, size_t len, uint8_t *dst)
+{
+    uint8_t nonce[KB_NONCE_LEN];
+    kbp2_session *s = io->sess;
+
+    if (s->send_key == NULL || s->send_seq == UINT64_MAX)
+        return KBP2_ERR_CRYPTO;
+    kb_record_nonce(s->send_seq, nonce);
+    if (!kb_gcm_seal(s->send_key, nonce, pt, (ULONG)len, dst, dst + len))
+        return KBP2_ERR_CRYPTO;
+    s->send_seq++;
+    return KBP2_OK;
+}
+
+static void io_mark_queued(kbp2_io *io, BOOL was_idle)
+{
+    if (was_idle)
+        io->send_deadline = GetTickCount64() + KBP2_SEND_MS;
+}
+
+kbp2_status kbp2_io_queue_record(kbp2_io *io, const uint8_t pt[KBP2_PLAINTEXT_LEN])
+{
+    BOOL was_idle = kbp2_io_send_idle(io);
+    kbp2_status st;
+
+    /* Full means the peer stopped reading long ago (the queue holds a chunk
+     * and 64 records); the connection is no use. */
+    if (!io_reserve(io, KBP2_RECORD_LEN))
+        return KBP2_ERR_TIMEOUT;
+    st = io_seal(io, pt, KBP2_PLAINTEXT_LEN, io->out + io->out_len);
+    if (st != KBP2_OK)
+        return st;
+    io->out_len += KBP2_RECORD_LEN;
+    io_mark_queued(io, was_idle);
+    return io_flush(io); /* small records go out at once */
+}
+
+kbp2_status kbp2_io_queue_chunk(kbp2_io *io, const uint8_t *chunk, size_t chunk_len)
+{
+    uint8_t hdr[KBP2_PLAINTEXT_LEN];
+    BOOL was_idle = kbp2_io_send_idle(io);
+    kbp2_status st;
+    uint8_t *dst;
+
+    if (chunk_len < KBCLIP_CHUNK_MIN || chunk_len > KBCLIP_CHUNK_MAX)
+        return KBP2_ERR_PROTOCOL;
+    if (io->sess->send_seq >= UINT64_MAX - 1)
+        return KBP2_ERR_CRYPTO; /* header and chunk need two seqs */
+    if (!io_reserve(io, KBP2_RECORD_LEN + chunk_len + KBP2_TAG_LEN))
+        return KBP2_ERR_TIMEOUT;
+
+    hdr[0] = KBP2_DATA;
+    hdr[1] = (uint8_t)((chunk_len >> 16) & 0xFF);
+    hdr[2] = (uint8_t)((chunk_len >> 8) & 0xFF);
+    hdr[3] = (uint8_t)(chunk_len & 0xFF);
+    dst = io->out + io->out_len;
+    st = io_seal(io, hdr, sizeof(hdr), dst);                       /* seq     */
+    if (st == KBP2_OK)
+        st = io_seal(io, chunk, chunk_len, dst + KBP2_RECORD_LEN); /* seq + 1 */
+    if (st != KBP2_OK) {
+        SecureZeroMemory(dst, KBP2_RECORD_LEN + chunk_len + KBP2_TAG_LEN);
+        return st;
+    }
+    io->out_len += KBP2_RECORD_LEN + chunk_len + KBP2_TAG_LEN;
+    io_mark_queued(io, was_idle);
+    return io_flush(io);
+}
+
+/* Read what is available. *have is set when a record or chunk is complete;
+ * *progress when a DATA header was consumed (so the chunk should be read at
+ * once). Returns KBP2_OK if the socket simply has nothing more right now. */
+static kbp2_status io_read(kbp2_io *io, kbp2_event *ev, BOOL *have, BOOL *progress)
+{
+    kbp2_conn *c = io->conn;
+    kbp2_session *s = io->sess;
+    uint8_t nonce[KB_NONCE_LEN];
+    size_t ct_len;
+
+    *have = FALSE;
+    *progress = FALSE;
+    while (io->in_got < io->in_need) {
+        int r, err;
+        kbp2_status st;
+        BOOL mid = io->in_got != 0 || io->in_chunk; /* inside a header+chunk pair */
+
+        if (c->sock == INVALID_SOCKET)
+            return KBP2_ERR_IO;
+        r = recv(c->sock, (char *)io->in + io->in_got, (int)(io->in_need - io->in_got), 0);
+        if (r > 0) {
+            io->in_got += (size_t)r;
+            continue;
+        }
+        /* A close on a record boundary is clean; anywhere else (including
+         * between a DATA header and its chunk) is a truncated message. */
+        if (r == 0)
+            return mid ? KBP2_ERR_IO : KBP2_ERR_CLOSED;
+        err = WSAGetLastError();
+        if (err == WSAEWOULDBLOCK)
+            return KBP2_OK;
+        st = error_status(err);
+        return (st == KBP2_ERR_CLOSED && mid) ? KBP2_ERR_IO : st;
+    }
+
+    if (s->recv_key == NULL || s->recv_seq == UINT64_MAX)
+        return KBP2_ERR_CRYPTO;
+    ct_len = io->in_need - KBP2_TAG_LEN;
+    kb_record_nonce(s->recv_seq, nonce);
+    if (!kb_gcm_open(s->recv_key, nonce, io->in, (ULONG)ct_len, io->in + ct_len, io->pt))
+        return KBP2_ERR_RECORD; /* caller must close the connection immediately */
+    s->recv_seq++;
+    io->live_deadline = GetTickCount64() + KBP2_LIVENESS_MS; /* any valid record or chunk */
+    io->in_got = 0;
+
+    if (io->in_chunk) {
+        io->in_chunk = FALSE;
+        io->in_need = KBP2_RECORD_LEN;
+        ev->type = KBP2_EV_CHUNK;
+        ev->data = io->pt;
+        ev->len = ct_len;
+        *have = TRUE;
+        return KBP2_OK;
+    }
+    if (io->pt[0] == KBP2_DATA) {
+        size_t n = ((size_t)io->pt[1] << 16) | ((size_t)io->pt[2] << 8) | (size_t)io->pt[3];
+        if (n < KBCLIP_CHUNK_MIN || n > KBCLIP_CHUNK_MAX)
+            return KBP2_ERR_PROTOCOL; /* a bad chunk length closes the connection */
+        io->in_chunk = TRUE;
+        io->in_need = n + KBP2_TAG_LEN;
+        *progress = TRUE;
+        return KBP2_OK;
+    }
+    ev->type = KBP2_EV_RECORD;
+    ev->data = io->pt;
+    ev->len = KBP2_PLAINTEXT_LEN;
+    *have = TRUE;
+    return KBP2_OK;
+}
+
+kbp2_status kbp2_io_next(kbp2_io *io, HANDLE wake, BOOL want_sent, kbp2_event *ev)
+{
+    kbp2_conn *c = io->conn;
+
+    ev->type = KBP2_EV_SENT;
+    ev->data = NULL;
+    ev->len = 0;
+    for (;;) {
+        WSANETWORKEVENTS ne;
+        ULONGLONG now, deadline;
+        BOOL have, progress, sending;
+        kbp2_status st;
+
+        if (stop_signaled(c))
+            return KBP2_STOPPED;
+        /* Incoming first: keystrokes never wait behind our own output. */
+        st = io_read(io, ev, &have, &progress);
+        if (st != KBP2_OK || have)
+            return st;
+        if (progress)
+            continue; /* DATA header consumed: its chunk is probably here already */
+        st = io_flush(io);
+        if (st != KBP2_OK)
+            return st;
+        sending = !kbp2_io_send_idle(io);
+        if (want_sent && !sending) {
+            ev->type = KBP2_EV_SENT;
+            return KBP2_OK;
+        }
+
+        now = GetTickCount64();
+        if (now >= io->live_deadline)
+            return KBP2_ERR_TIMEOUT;          /* section 6: nothing valid for 6 s */
+        if (sending && now >= io->send_deadline)
+            return KBP2_ERR_TIMEOUT;          /* the peer stopped reading */
+        deadline = io->live_deadline;
+        if (sending && io->send_deadline < deadline)
+            deadline = io->send_deadline;
+
+        st = conn_wait(c, deadline, TRUE, wake, &ne);
+        if (st == KBP2_ERR_TIMEOUT)
+            continue; /* the checks above report which deadline passed */
+        if (st != KBP2_OK)
+            return st; /* KBP2_STOPPED, KBP2_WOKEN or KBP2_ERR_IO */
+    }
+}
+
 void kbp2_session_free(kbp2_session *s)
 {
     kb_key_destroy(&s->send_key);

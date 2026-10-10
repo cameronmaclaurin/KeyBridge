@@ -2,6 +2,12 @@
  * KeyBridge - background connection worker: connect, handshake, inject keys,
  * answer PINGs, reconnect with backoff. Status changes are posted to the UI
  * window as msg(wParam = generation, lParam = kb_status).
+ *
+ * It also carries the shared clipboard (docs/PROTOCOL.md 5a): it sends CAPS
+ * first in every session, sends text that clipboard.c hands it (only if the
+ * Mac's CAPS had bit0), and passes received text back to clipboard.c. It is
+ * the only thread that writes to the socket. clipboard_init must run before
+ * the first worker_start.
  */
 #ifndef KB_WORKER_H
 #define KB_WORKER_H

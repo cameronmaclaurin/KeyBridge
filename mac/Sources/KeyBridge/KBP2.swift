@@ -28,6 +28,106 @@ enum KBP2 {
         case ping = 0x02
         case pong = 0x03
         case releaseAll = 0x04
+        case data = 0x05        // §5a: header; a sealed chunk follows
+        case caps = 0x06        // §5a: first record after authentication
+    }
+
+    /// §5a CAPS `b1` bits.
+    static let capClipboardText: UInt8 = 0x01
+
+    /// §5a DATA chunks.
+    static let tagLength = 16
+    static let chunkHeaderLength = 4            // kind(1) + flags(1) + transfer_id(2)
+    static let maxChunkPayload = 16384
+    static let minChunkPlaintext = chunkHeaderLength + 1
+    static let maxChunkPlaintext = chunkHeaderLength + maxChunkPayload
+    static let maxTransferBytes = 1_048_576
+
+    enum DataKind: UInt8 {
+        case clipboardText = 0x01
+    }
+
+    static let chunkFirst: UInt8 = 0x01
+    static let chunkLast: UInt8 = 0x02
+}
+
+// MARK: - §5a Transfers
+
+enum KBP2Transfer {
+    /// Splits `payload` (1...maxTransferBytes bytes) into chunk plaintexts:
+    /// kind || flags || transfer_id(BE) || ≤ 16384 payload bytes.
+    static func chunks(kind: UInt8, transferID: UInt16, payload: Data) -> [Data] {
+        let p = Data(payload)  // re-base indices at 0
+        var out: [Data] = []
+        var offset = 0
+        repeat {
+            let end = min(offset + KBP2.maxChunkPayload, p.count)
+            var flags: UInt8 = 0
+            if offset == 0 { flags |= KBP2.chunkFirst }
+            if end == p.count { flags |= KBP2.chunkLast }
+            var c = Data(capacity: KBP2.chunkHeaderLength + end - offset)
+            c.append(contentsOf: [kind, flags, UInt8(transferID >> 8), UInt8(transferID & 0xFF)])
+            c.append(p[offset..<end])
+            out.append(c)
+            offset = end
+        } while offset < p.count
+        return out
+    }
+
+    static func isValidUTF8(_ d: Data) -> Bool {
+        var it = d.makeIterator()
+        var decoder = UTF8()
+        while true {
+            switch decoder.decode(&it) {
+            case .scalarValue: continue
+            case .emptyInput: return true
+            case .error: return false
+            }
+        }
+    }
+}
+
+/// §5a reassembly for one direction.
+struct KBP2Reassembler {
+    private var kind: UInt8 = 0
+    private var transferID: UInt16 = 0
+    private var buffer = Data()
+    /// A transfer is being collected (a `first` arrived; no `last`, no discard yet).
+    private(set) var inProgress = false
+
+    /// Feed one decrypted chunk plaintext (N ≥ 5). Returns the transfer when its `last` chunk arrives.
+    mutating func add(_ chunk: Data) -> (kind: UInt8, payload: Data)? {
+        let c = Data(chunk)
+        guard c.count >= KBP2.minChunkPlaintext else { return nil }
+        let k = c[0], flags = c[1]
+        let id = UInt16(c[2]) << 8 | UInt16(c[3])
+        let payload = c.subdata(in: KBP2.chunkHeaderLength..<c.count)
+
+        if flags & KBP2.chunkFirst != 0 {
+            // Starts a new transfer and abandons any unfinished one.
+            kind = k
+            transferID = id
+            buffer = Data()
+            inProgress = true
+        } else if !inProgress || id != transferID || k != kind {
+            return nil  // not part of the transfer being collected
+        }
+
+        guard buffer.count + payload.count <= KBP2.maxTransferBytes else {
+            reset()  // too big: ignore chunks until the next `first`
+            return nil
+        }
+        buffer.append(payload)
+
+        guard flags & KBP2.chunkLast != 0 else { return nil }
+        let done = (kind, buffer)
+        reset()
+        return done
+    }
+
+    mutating func reset() {
+        buffer = Data()
+        inProgress = false
     }
 }
 
@@ -186,13 +286,45 @@ struct KBP2RecordChannel {
     /// Opens a 20-byte record. nil = authentication failure (caller must close).
     mutating func open(_ record: Data) -> [UInt8]? {
         let r = Data(record)
-        guard r.count == KBP2.recordLength, receiveSeq != UInt64.max,
+        guard r.count == KBP2.recordLength, let pt = openSealed(r) else { return nil }
+        return Array(pt)
+    }
+
+    /// §5a: a DATA header followed immediately by its sealed chunk (next seq), as one
+    /// contiguous buffer so they are never split on the wire. nil if the counter is exhausted.
+    mutating func sealData(chunk: Data) -> Data? {
+        let n = chunk.count
+        guard n >= KBP2.minChunkPlaintext, n <= KBP2.maxChunkPlaintext,
+              sendSeq < UInt64.max - 1,
+              var out = seal(KBP2.RecordType.data.rawValue,
+                             UInt8(n >> 16 & 0xFF), UInt8(n >> 8 & 0xFF), UInt8(n & 0xFF)),
+              let box = try? AES.GCM.seal(chunk, using: sendKey, nonce: Self.nonce(sendSeq))
+        else { return nil }
+        sendSeq += 1
+        out.append(box.ciphertext)
+        out.append(box.tag)
+        return out
+    }
+
+    /// §5a: opens the sealed chunk (`N + 16` bytes) that follows a DATA header.
+    /// nil = wrong length or authentication failure (caller must close).
+    mutating func openChunk(_ sealed: Data, length n: Int) -> Data? {
+        let s = Data(sealed)
+        guard n >= KBP2.minChunkPlaintext, n <= KBP2.maxChunkPlaintext,
+              s.count == n + KBP2.tagLength else { return nil }
+        return openSealed(s)
+    }
+
+    /// ciphertext || tag(16) with the next receive seq.
+    private mutating func openSealed(_ s: Data) -> Data? {
+        guard s.count > KBP2.tagLength, receiveSeq != UInt64.max,
               let box = try? AES.GCM.SealedBox(
-                nonce: Self.nonce(receiveSeq), ciphertext: r.prefix(4), tag: r.suffix(16)),
+                nonce: Self.nonce(receiveSeq), ciphertext: s.prefix(s.count - KBP2.tagLength),
+                tag: s.suffix(KBP2.tagLength)),
               let pt = try? AES.GCM.open(box, using: receiveKey)
         else { return nil }
         receiveSeq += 1
-        return Array(pt)
+        return pt
     }
 
     static func keyFields(isDown: Bool, isExtended: Bool, vk: UInt16) -> (UInt8, UInt8, UInt8) {

@@ -38,6 +38,10 @@ BOOL autostart_default(void);
 /* "Automatically Check for Updates": AutoUpdate DWORD, default on. */
 BOOL prefs_auto_update(void);
 BOOL prefs_set_auto_update(BOOL enable);
+
+/* "Share Clipboard": ShareClipboard DWORD, default on (docs/PROTOCOL.md §5a). */
+BOOL prefs_share_clipboard(void);
+BOOL prefs_set_share_clipboard(BOOL enable);
 /* "Skip This Version": SkippedVersion string (an X.Y.Z version). */
 BOOL prefs_is_skipped_version(const char *version);
 BOOL prefs_set_skipped_version(const char *version);

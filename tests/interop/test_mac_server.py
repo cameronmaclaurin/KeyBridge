@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Reference vs the Mac selftest build (docs/PROTOCOL.md Appendix A.1 and A.3).
+"""Reference vs the Mac selftest build (docs/PROTOCOL.md Appendix A.1 and A.3,
+including the shared clipboard of section 5a).
 
 Build the selftest binary first:
     cd mac && swift build -Xswiftc -DKEYBRIDGE_SELFTEST
@@ -14,10 +15,19 @@ import sys
 
 from harness import (
     A2_TRANSCRIPT,
+    LIMIT_TEXT,
     LONG_NAME,
     MAC_NAME,
+    MULTI_CHUNK_TEXT,
+    NON_ASCII_SPLIT_TEXT,
+    NON_ASCII_TEXT,
+    OVER_LIMIT_TEXT,
     PC_NAME,
+    SMALL_TEXT,
     Checks,
+    a2_with_clip,
+    clip_file,
+    clip_line,
     free_port,
     new_psk,
     other_psk,
@@ -32,8 +42,8 @@ from harness import (
 BINARY = ""
 
 
-def mac_server(port: int, psk: str) -> list[str]:
-    return [BINARY, "--selftest-server", "--port", str(port), "--psk", psk]
+def mac_server(port: int, psk: str, *extra: str) -> list[str]:
+    return [BINARY, "--selftest-server", "--port", str(port), "--psk", psk, *extra]
 
 
 def mac_pair_server(port: int, *extra: str, name: str = MAC_NAME) -> list[str]:
@@ -45,10 +55,10 @@ def mac_pair_server(port: int, *extra: str, name: str = MAC_NAME) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def session(psk: str, client_psk: str | None = None, client_extra=()):
+def session(psk: str, client_psk: str | None = None, client_extra=(), server_extra=()):
     port = free_port()
     return run_pair(
-        mac_server(port, psk),
+        mac_server(port, psk, *server_extra),
         ref_client(port, client_psk or psk, *client_extra),
         server_name="mac-server",
         client_name="reference-client",
@@ -114,6 +124,97 @@ def test_psk_usage_error():
         proc = run_alone([BINARY, "--selftest-server", "--port", str(free_port()), "--psk", bad], f"mac-server --psk {bad[:6]}...")
         c.procs += (proc,)
         c.exit_code(proc, 64)
+    c.done()
+
+
+# ---------------------------------------------------------------------------
+# Clipboard (5a, A.1 --clip-file / CLIP): Mac server <-> reference client
+# ---------------------------------------------------------------------------
+
+
+def check_mac_sends(data: bytes, delivered: bool = True, client_extra=()) -> None:
+    """Mac --clip-file → the reference client prints a matching CLIP before PING (or none)."""
+    server, client = session(new_psk(), server_extra=["--clip-file", clip_file(data)], client_extra=client_extra)
+    c = Checks(server, client)
+    c.exit_code(client, 0)
+    c.stdout_equals(client, a2_with_clip(data if delivered else None))
+    c.exit_code(server, 0)
+    c.done()
+
+
+def check_mac_receives(data: bytes, *extra: str, delivered: bool = True) -> None:
+    """Reference client --clip-file → the Mac prints a matching CLIP (or none); A.2 transcript unchanged."""
+    server, client = session(new_psk(), client_extra=["--clip-file", clip_file(data), *extra])
+    c = Checks(server, client)
+    c.exit_code(client, 0)
+    c.stdout_equals(client, A2_TRANSCRIPT)
+    c.exit_code(server, 0)
+    c.stdout_equals(server, ["LISTENING"] + ([clip_line(data)] if delivered else []))
+    c.done()
+
+
+def test_clip_mac_sends_small():
+    check_mac_sends(SMALL_TEXT)
+
+
+def test_clip_mac_sends_multi_chunk():
+    check_mac_sends(MULTI_CHUNK_TEXT)
+
+
+def test_clip_mac_sends_non_ascii():
+    check_mac_sends(NON_ASCII_TEXT)
+    check_mac_sends(NON_ASCII_SPLIT_TEXT)  # an emoji straddles the 16384-byte chunk boundary
+
+
+def test_clip_mac_sends_1mib():
+    check_mac_sends(LIMIT_TEXT)
+
+
+def test_clip_mac_does_not_send_over_limit():
+    check_mac_sends(OVER_LIMIT_TEXT, delivered=False)  # spec 5a: over 1,048,576 bytes is not sent at all
+
+
+def test_clip_mac_respects_peer_caps():
+    check_mac_sends(SMALL_TEXT, delivered=False, client_extra=["--caps", "0"])  # sharing off on the PC
+    check_mac_sends(SMALL_TEXT, delivered=False, client_extra=["--no-caps"])  # a v1.4 PC
+
+
+def test_clip_mac_receives_small():
+    check_mac_receives(SMALL_TEXT)
+
+
+def test_clip_mac_receives_multi_chunk_non_ascii():
+    check_mac_receives(MULTI_CHUNK_TEXT)
+    check_mac_receives(NON_ASCII_SPLIT_TEXT)
+
+
+def test_clip_mac_receives_1mib():
+    check_mac_receives(LIMIT_TEXT)
+
+
+def test_clip_mac_discards_over_limit():
+    check_mac_receives(OVER_LIMIT_TEXT, "--clip-ignore-limit", delivered=False)
+
+
+def test_clip_mac_discards_invalid_utf8():
+    check_mac_receives(MULTI_CHUNK_TEXT, "--clip-invalid-utf8", delivered=False)
+
+
+def test_clip_mac_discards_chunk_without_first():
+    check_mac_receives(MULTI_CHUNK_TEXT, "--clip-no-first", delivered=False)
+
+
+def test_clip_mac_ignores_stray_transfer_id():
+    check_mac_receives(MULTI_CHUNK_TEXT, "--clip-wrong-id")  # the stray chunk is dropped, the real text arrives
+
+
+def test_clip_mac_drops_corrupt_chunk():
+    server, client = session(new_psk(), client_extra=["--clip-file", clip_file(MULTI_CHUNK_TEXT), "--clip-corrupt-chunk"])
+    c = Checks(server, client)
+    c.exit_code(server, 3)  # A.1: a client record failed authentication
+    c.stdout_equals(server, ["LISTENING"])
+    c.terminated(client)
+    c.require("RELEASE_ALL" not in client.stdout, "Mac sent RELEASE_ALL after a bad chunk (it must close at once)")
     c.done()
 
 
@@ -229,6 +330,20 @@ TESTS = [
     ("session invalid P-256 point: server exit 2, nothing sent", test_invalid_point),
     ("session stalled handshake: server times out (exit 2)", test_handshake_timeout),
     ("session malformed --psk: exit 64", test_psk_usage_error),
+    ("clipboard: Mac --clip-file small text → matching CLIP", test_clip_mac_sends_small),
+    ("clipboard: Mac --clip-file 40 KB (3 chunks) → matching CLIP", test_clip_mac_sends_multi_chunk),
+    ("clipboard: Mac --clip-file non-ASCII (emoji, CJK) → matching CLIP", test_clip_mac_sends_non_ascii),
+    ("clipboard: Mac --clip-file exactly 1,048,576 bytes → matching CLIP", test_clip_mac_sends_1mib),
+    ("clipboard: Mac does not send a 1,048,577-byte text", test_clip_mac_does_not_send_over_limit),
+    ("clipboard: Mac sends nothing to a PC with CAPS 0 or no CAPS", test_clip_mac_respects_peer_caps),
+    ("clipboard: reference --clip-file small → Mac prints CLIP", test_clip_mac_receives_small),
+    ("clipboard: reference --clip-file 40 KB, non-ASCII → Mac prints CLIP", test_clip_mac_receives_multi_chunk_non_ascii),
+    ("clipboard: reference sends exactly 1,048,576 bytes → Mac prints CLIP", test_clip_mac_receives_1mib),
+    ("clipboard: 1,048,577 bytes → Mac discards (no CLIP)", test_clip_mac_discards_over_limit),
+    ("clipboard: invalid UTF-8 → Mac discards (no CLIP)", test_clip_mac_discards_invalid_utf8),
+    ("clipboard: chunk without `first` → Mac discards", test_clip_mac_discards_chunk_without_first),
+    ("clipboard: stray chunk with another transfer_id → Mac ignores it", test_clip_mac_ignores_stray_transfer_id),
+    ("clipboard: corrupted chunk → Mac drops the session (exit 3)", test_clip_mac_drops_corrupt_chunk),
     ("pairing positive: same SAS and ltk, then a session with that ltk", test_pair_positive),
     ("pairing positive with long UTF-8 names", test_pair_long_names),
     ("pairing: Mac --confirm no", test_pair_mac_cancels),

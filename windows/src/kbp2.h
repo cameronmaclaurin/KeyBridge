@@ -8,6 +8,7 @@
 
 #include "common.h"
 #include "kbutil.h"
+#include "kbclip.h"
 
 #define KBP2_PORT_DEFAULT      L"9876"
 #define KBP2_MAGIC             "KBR2"
@@ -32,8 +33,18 @@
 #define KBP2_PING              0x02
 #define KBP2_PONG              0x03
 #define KBP2_RELEASE_ALL       0x04
+#define KBP2_DATA              0x05 /* b1 b2 b3 = sealed chunk length N (24-bit BE); section 5a */
+#define KBP2_CAPS              0x06 /* b1 = capability bits; section 5a */
 #define KBP2_FLAG_DOWN         0x01
 #define KBP2_FLAG_EXTENDED     0x02
+#define KBP2_CAPS_CLIPBOARD    0x01 /* CAPS b1 bit0: "I can receive clipboard text" */
+
+#define KBP2_TAG_LEN           16
+/* Largest thing ever written in one piece: a DATA header and its sealed chunk
+ * (they are never split, section 5a). */
+#define KBP2_FRAME_MAX         (KBP2_RECORD_LEN + KBCLIP_CHUNK_MAX + KBP2_TAG_LEN)
+/* Send queue: one frame plus room for small records (PONG, CAPS) behind it. */
+#define KBP2_OUT_CAP           (KBP2_FRAME_MAX + 64 * KBP2_RECORD_LEN)
 
 typedef enum {
     KBP2_OK = 0,
@@ -98,6 +109,70 @@ kbp2_status kbp2_send_record(kbp2_conn *c, kbp2_session *s, const uint8_t pt[KBP
 kbp2_status kbp2_recv_record(kbp2_conn *c, kbp2_session *s, uint8_t pt[KBP2_PLAINTEXT_LEN],
                              DWORD timeout_ms);
 void        kbp2_session_free(kbp2_session *s);
+
+/* ------------------------------------------------------------------------ */
+/* Session I/O with clipboard data (sections 5, 5a, 6)                      */
+/* ------------------------------------------------------------------------ */
+/*
+ * A non-blocking record pump for an authenticated session: sends are queued
+ * (sealed in seq order at queue time) and written as the socket accepts them,
+ * while received records are decoded as soon as they are complete, so a
+ * large outgoing clipboard transfer never delays incoming keystrokes. One
+ * thread owns a kbp2_io; it is the only writer to the socket. Do not mix with
+ * kbp2_send_record / kbp2_recv_record on the same session.
+ *
+ * Liveness (section 6): kbp2_io_next fails with KBP2_ERR_TIMEOUT if no valid
+ * record or chunk arrives for KBP2_LIVENESS_MS, or if queued output makes no
+ * progress for KBP2_SEND_MS.
+ *
+ * The struct is about 50 KB: allocate it on the heap (or statically).
+ */
+typedef enum {
+    KBP2_EV_RECORD = 1,  /* data = 4-byte record plaintext (never a DATA header) */
+    KBP2_EV_CHUNK,       /* data = decrypted chunk plaintext, len = N (5..16388) */
+    KBP2_EV_SENT         /* only with want_sent: the send queue is empty */
+} kbp2_event_type;
+
+typedef struct {
+    kbp2_event_type type;
+    const uint8_t  *data; /* points into the kbp2_io; valid until the next call */
+    size_t          len;
+} kbp2_event;
+
+typedef struct {
+    kbp2_conn    *conn;
+    kbp2_session *sess;
+    ULONGLONG     live_deadline;
+    ULONGLONG     send_deadline;
+    size_t        in_need;   /* KBP2_RECORD_LEN, or N + 16 while reading a chunk */
+    size_t        in_got;
+    BOOL          in_chunk;
+    size_t        out_pos;
+    size_t        out_len;
+    uint8_t       in[KBCLIP_CHUNK_MAX + KBP2_TAG_LEN];
+    uint8_t       pt[KBCLIP_CHUNK_MAX];
+    uint8_t       out[KBP2_OUT_CAP];
+} kbp2_io;
+
+void        kbp2_io_init(kbp2_io *io, kbp2_conn *c, kbp2_session *s);
+/* Wipe buffered plaintext/ciphertext. Does not touch the conn or session. */
+void        kbp2_io_wipe(kbp2_io *io);
+/* Seal one 4-byte record with the next seq and queue it (then try to send). */
+kbp2_status kbp2_io_queue_record(kbp2_io *io, const uint8_t pt[KBP2_PLAINTEXT_LEN]);
+/* TRUE when everything queued has been handed to the socket. Queue the next
+ * chunk only then, so small records never wait behind more than one chunk. */
+BOOL        kbp2_io_send_idle(const kbp2_io *io);
+/* Queue a DATA header (seq) and its sealed chunk (seq + 1) back to back.
+ * chunk_len must be KBCLIP_CHUNK_MIN..KBCLIP_CHUNK_MAX. */
+kbp2_status kbp2_io_queue_chunk(kbp2_io *io, const uint8_t *chunk, size_t chunk_len);
+/* Send what the socket accepts and wait for the next event: a record or a
+ * chunk (KBP2_OK), the wake event (KBP2_WOKEN; optional), KBP2_EV_SENT when
+ * want_sent and the queue is empty, the conn's stop event (KBP2_STOPPED), or
+ * an error. A clean close on a record boundary is KBP2_ERR_CLOSED. A DATA
+ * header with N outside 5..16388 is KBP2_ERR_PROTOCOL; a record or chunk that
+ * fails authentication is KBP2_ERR_RECORD. Data that has already arrived is
+ * always returned before the wake event and before KBP2_EV_SENT. */
+kbp2_status kbp2_io_next(kbp2_io *io, HANDLE wake, BOOL want_sent, kbp2_event *ev);
 
 const char *kbp2_status_text(kbp2_status st);
 

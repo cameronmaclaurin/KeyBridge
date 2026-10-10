@@ -18,40 +18,85 @@ IDI_TRAY_OFF    ICON    "../assets/tray-off.ico"
 // (CREATEPROCESS_MANIFEST_RESOURCE_ID). The linker runs with /MANIFEST:NO.
 1 24 "keybridge.manifest"
 
+// Dialog layout (src/ui.h draws it): a white content area with a header
+// (app icon, semibold title, secondary line) and a gray command area along
+// the bottom, which starts 7 DLU above the IDCANCEL button. Margins are 7 DLU,
+// related controls are 4 DLU apart, buttons are 50x14 DLU. Segoe UI 9 pt is
+// named explicitly: "MS Shell Dlg 2" still maps to Tahoma. On Windows 11
+// main.c swaps in Segoe UI Variable at the same size.
+
 // Setup: pick a Mac found on the network (or type an address), then Pair.
 // If the DNS-SD APIs are missing, main.c hides the list and moves the
 // manual-entry controls up.
-IDD_SETUP DIALOGEX 0, 0, 262, 226
-STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+IDD_SETUP DIALOGEX 0, 0, 262, 236
+STYLE DS_SETFONT | DS_FIXEDSYS | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 EXSTYLE WS_EX_APPWINDOW
-CAPTION "Pair with your Mac"
+CAPTION "KeyBridge"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
-    LTEXT           "On your Mac, click the KeyBridge menu bar icon → Pair a Windows PC…", IDC_HELP_TEXT, 10, 8, 242, 18
-    LTEXT           "&Macs on your network:", IDC_LIST_LABEL, 10, 30, 242, 8
-    LISTBOX         IDC_MAC_LIST, 10, 41, 242, 64, LBS_NOTIFY | LBS_SORT | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "&Or enter the address manually:", IDC_MANUAL_LABEL, 10, 113, 242, 8
-    EDITTEXT        IDC_HOST, 10, 124, 242, 14, ES_AUTOHSCROLL
-    LTEXT           "For example Camerons-MacBook.local, 192.168.1.20 or host:port", IDC_HOST_HINT, 10, 140, 242, 8
-    AUTOCHECKBOX    "&Start KeyBridge when I sign in", IDC_AUTOSTART, 10, 158, 242, 10
-    LTEXT           "", IDC_SETUP_STATUS, 10, 174, 242, 24, SS_NOPREFIX
-    DEFPUSHBUTTON   "&Pair", IDOK, 148, 204, 50, 14
-    PUSHBUTTON      "Cancel", IDCANCEL, 202, 204, 50, 14
+    CONTROL         "", IDC_HDR_ICON, "Static", SS_OWNERDRAW, 7, 7, 20, 20
+    LTEXT           "Pair with your Mac", IDC_HDR_TITLE, 33, 7, 222, 12, SS_NOPREFIX
+    LTEXT           "On your Mac, click the KeyBridge menu bar icon → Pair a Windows PC…", IDC_HELP_TEXT, 33, 20, 222, 16, SS_NOPREFIX
+    LTEXT           "&Macs on your network:", IDC_LIST_LABEL, 7, 44, 248, 8
+    LISTBOX         IDC_MAC_LIST, 7, 55, 248, 60, LBS_NOTIFY | LBS_SORT | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "&Or enter the address manually:", IDC_MANUAL_LABEL, 7, 123, 248, 8
+    EDITTEXT        IDC_HOST, 7, 134, 248, 14, ES_AUTOHSCROLL
+    LTEXT           "For example Camerons-MacBook.local, 192.168.1.20 or host:port", IDC_HOST_HINT, 7, 151, 248, 8, SS_NOPREFIX
+    AUTOCHECKBOX    "&Start KeyBridge when I sign in", IDC_AUTOSTART, 7, 167, 248, 10
+    LTEXT           "", IDC_SETUP_STATUS, 7, 183, 248, 18, SS_NOPREFIX
+    DEFPUSHBUTTON   "&Pair", IDOK, 151, 215, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 205, 215, 50, 14
 END
 
 // Compare: both screens must show the same number. Confirm is not IDOK
-// and not the default button, so Enter can't confirm without looking.
-IDD_COMPARE DIALOGEX 0, 0, 230, 134
-STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Pair with your Mac"
+// and not the default button, so Enter can't confirm without looking;
+// main.c puts the focus on Cancel.
+IDD_COMPARE DIALOGEX 0, 0, 240, 129
+STYLE DS_SETFONT | DS_FIXEDSYS | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "KeyBridge"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
-    LTEXT           "", IDC_CMP_TITLE, 10, 10, 210, 10, SS_NOPREFIX | SS_ENDELLIPSIS
-    LTEXT           "Make sure your Mac shows the same number.", IDC_CMP_HINT, 10, 24, 210, 10
-    CTEXT           "", IDC_CMP_NUMBER, 10, 40, 210, 34, SS_NOPREFIX | SS_CENTERIMAGE
-    CTEXT           "", IDC_CMP_STATUS, 10, 82, 210, 10, SS_NOPREFIX
-    PUSHBUTTON      "&Confirm", IDC_CMP_CONFIRM, 116, 110, 50, 14
-    PUSHBUTTON      "Cancel", IDCANCEL, 170, 110, 50, 14
+    CONTROL         "", IDC_HDR_ICON, "Static", SS_OWNERDRAW, 7, 7, 20, 20
+    LTEXT           "", IDC_CMP_TITLE, 33, 7, 200, 12, SS_NOPREFIX | SS_ENDELLIPSIS
+    LTEXT           "Make sure your Mac shows the same number.", IDC_CMP_HINT, 33, 20, 200, 8, SS_NOPREFIX
+    CONTROL         "", IDC_CMP_NUMBER, "Static", SS_OWNERDRAW, 7, 37, 226, 42
+    CTEXT           "", IDC_CMP_STATUS, 7, 85, 226, 8, SS_NOPREFIX
+    PUSHBUTTON      "&Confirm", IDC_CMP_CONFIRM, 129, 108, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 183, 108, 50, 14
+END
+
+// Settings (modeless; tray menu > Settings…, or KeyBridge.exe --show-settings).
+// Every change applies at once, so the only button is Close.
+IDD_SETTINGS DIALOGEX 0, 0, 252, 236
+STYLE DS_SETFONT | DS_FIXEDSYS | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+EXSTYLE WS_EX_APPWINDOW
+CAPTION "KeyBridge Settings"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    CONTROL         "", IDC_HDR_ICON, "Static", SS_OWNERDRAW, 7, 7, 20, 20
+    LTEXT           "KeyBridge", IDC_HDR_TITLE, 33, 7, 212, 12, SS_NOPREFIX
+    LTEXT           "Type on this PC with your Mac’s keyboard.", IDC_HDR_SUBTITLE, 33, 20, 212, 8, SS_NOPREFIX
+
+    LTEXT           "General", IDC_SET_SEC_GENERAL, 7, 38, 238, 8, SS_NOPREFIX
+    AUTOCHECKBOX    "&Start with Windows", IDC_SET_AUTOSTART, 7, 50, 238, 10
+    AUTOCHECKBOX    "S&hare clipboard with your Mac", IDC_SET_CLIPBOARD, 7, 64, 238, 10
+    LTEXT           "Copy on one computer, paste on the other. Text only.", IDC_SET_CLIP_HELP, 17, 75, 228, 8, SS_NOPREFIX
+    CONTROL         "", IDC_SET_SEP1, "Static", SS_OWNERDRAW, 7, 85, 238, 8
+
+    LTEXT           "Updates", IDC_SET_SEC_UPDATES, 7, 96, 238, 8, SS_NOPREFIX
+    AUTOCHECKBOX    "&Automatically check for updates", IDC_SET_AUTOUPDATE, 7, 108, 238, 10
+    LTEXT           "", IDC_SET_VERSION, 7, 125, 172, 8, SS_NOPREFIX | SS_ENDELLIPSIS
+    PUSHBUTTON      "Check &Now", IDC_SET_CHECKNOW, 185, 122, 60, 14
+    CONTROL         "", IDC_SET_SEP2, "Static", SS_OWNERDRAW, 7, 139, 238, 8
+
+    LTEXT           "Mac", IDC_SET_SEC_MAC, 7, 150, 238, 8, SS_NOPREFIX
+    LTEXT           "", IDC_SET_MAC_NAME, 7, 162, 238, 8, SS_NOPREFIX | SS_ENDELLIPSIS
+    LTEXT           "●", IDC_SET_MAC_DOT, 7, 173, 8, 8, SS_NOPREFIX
+    LTEXT           "", IDC_SET_MAC_STATUS, 15, 173, 230, 8, SS_NOPREFIX | SS_ENDELLIPSIS
+    PUSHBUTTON      "&Pair with a Different Mac…", IDC_SET_PAIR, 7, 187, 110, 14
+    PUSHBUTTON      "&Forget This Mac", IDC_SET_FORGET, 121, 187, 70, 14
+
+    DEFPUSHBUTTON   "Close", IDCANCEL, 195, 215, 50, 14
 END
 
 VS_VERSION_INFO VERSIONINFO

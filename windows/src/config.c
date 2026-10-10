@@ -20,6 +20,7 @@
 #define KB_APP_KEY        L"Software\\KeyBridge"
 #define KB_PREF_AUTOSTART L"StartAtSignIn"
 #define KB_PREF_AUTO_UPDATE L"AutoUpdate"
+#define KB_PREF_SHARE_CLIPBOARD L"ShareClipboard"
 #define KB_PREF_SKIPPED   L"SkippedVersion"
 #define KB_PREF_LAST_CHECK L"LastUpdateCheck"
 #define KB_VERSION_CHARS  32
@@ -316,6 +317,21 @@ BOOL prefs_set_auto_update(BOOL enable)
 {
     DWORD v = enable ? 1u : 0u;
     return pref_set(KB_PREF_AUTO_UPDATE, REG_DWORD, &v, (DWORD)sizeof(v));
+}
+
+BOOL prefs_share_clipboard(void)
+{
+    DWORD v = 1, cb = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, KB_APP_KEY, KB_PREF_SHARE_CLIPBOARD, RRF_RT_REG_DWORD,
+                     NULL, &v, &cb) == ERROR_SUCCESS)
+        return v != 0;
+    return TRUE;
+}
+
+BOOL prefs_set_share_clipboard(BOOL enable)
+{
+    DWORD v = enable ? 1u : 0u;
+    return pref_set(KB_PREF_SHARE_CLIPBOARD, REG_DWORD, &v, (DWORD)sizeof(v));
 }
 
 /* An ASCII version string as UTF-16. FALSE if it is empty or too long. */

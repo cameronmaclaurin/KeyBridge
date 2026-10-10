@@ -26,10 +26,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Settin
     private var settingsWindow: SettingsWindowController?
     private let updater = UpdateController()
     private let settings = AppSettings.shared
+    private var clipboardSync: ClipboardSync?  // §5a shared clipboard
 
-    private var modeLine: NSMenuItem!
+    private let menuHeader = MenuHeaderView()
     private var connLine: NSMenuItem!
-    private var pairedLine: NSMenuItem!
     private var forgetItem: NSMenuItem!
     private var warningLine: NSMenuItem!
     private var accessibilityItem: NSMenuItem!
@@ -96,6 +96,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Settin
         s.macDisplayName = name
         s.setServiceName(name)  // §1a: advertise _keybridge._tcp as this Mac's name
         server = s
+        s.clipboardEnabled = settings.shareClipboard
+        clipboardSync = ClipboardSync(server: s)
         nameWatcher = SystemNameWatcher { [weak self] in self?.systemNamesChanged() }
         // Hot path: tap callback → seal → send, all on the main thread, no extra hops.
         capture.onKeyEvent = { [unowned s] evt in
@@ -441,34 +443,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Settin
         menu.delegate = self
         menu.autoenablesItems = false
 
-        modeLine = info("")
-        pairedLine = info("")
-        connLine = info("")
-        warningLine = info("")
+        // Status: header, then any problem that needs attention.
+        let header = NSMenuItem()
+        header.view = menuHeader
+        header.isEnabled = false
+        menu.addItem(header)
+        warningLine = info("Secure Input in another app is blocking KeyBridge", symbol: "exclamationmark.triangle")
         warningLine.isHidden = true
-        accessibilityItem = item("Grant Accessibility Permission…", #selector(openAccessibilitySettings))
+        connLine = info("", symbol: "exclamationmark.triangle")
+        connLine.isHidden = true
+        accessibilityItem = item("Grant Accessibility Permission…", #selector(openAccessibilitySettings), symbol: "lock.shield")
         accessibilityItem.isHidden = true
-        [modeLine, pairedLine, connLine, warningLine, accessibilityItem].forEach { menu.addItem($0) }
+        [warningLine, connLine, accessibilityItem].forEach { menu.addItem($0) }
         menu.addItem(.separator())
 
-        toggleItem = item("", #selector(onToggle))
+        // Switching.
+        toggleItem = item("", #selector(onToggle), symbol: "arrow.left.arrow.right")
         menu.addItem(toggleItem)
         menu.addItem(.separator())
 
-        menu.addItem(item("Pair a Windows PC…", #selector(showPairingWindow)))
-        forgetItem = item("Forget This PC…", #selector(forgetPC))
+        // Your PC.
+        menu.addItem(item("Pair a Windows PC…", #selector(showPairingWindow), symbol: "link.badge.plus"))
+        forgetItem = item("Forget This PC…", #selector(forgetPC), symbol: "minus.circle")
         menu.addItem(forgetItem)
-        loginItem = item("Launch at Login", #selector(toggleLaunchAtLogin))
-        menu.addItem(loginItem)
         menu.addItem(.separator())
 
-        let settingsItem = item("Settings…", #selector(showSettings))
+        // App.
+        loginItem = item("Launch at Login", #selector(toggleLaunchAtLogin), symbol: "sunrise")
+        menu.addItem(loginItem)
+        let settingsItem = item("Settings…", #selector(showSettings), symbol: "gearshape")
         settingsItem.keyEquivalent = ","
         menu.addItem(settingsItem)
-
-        menu.addItem(item("Check for Updates…", #selector(checkForUpdates)))
-        menu.addItem(item("About KeyBridge", #selector(showAbout)))
+        menu.addItem(item("Check for Updates…", #selector(checkForUpdates), symbol: "arrow.down.circle"))
+        menu.addItem(item("About KeyBridge", #selector(showAbout), symbol: "info.circle"))
+        menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit KeyBridge", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        quit.image = NSMenuItem.symbolImage("power")
         menu.addItem(quit)
 
         statusItem.menu = menu
@@ -507,23 +517,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Settin
             button.toolTip = label
         }
 
-        modeLine.title = remoteMode ? "Windows mode: typing on your PC" : "Local mode: typing on this Mac"
-
-        pairedLine.title = pairedPCName.map { "Paired with \($0)" } ?? "Not paired"
-        let status = connectionStatus()
-        connLine.title = status ?? ""
-        connLine.isHidden = status == nil
+        updateMenuHeader()
+        connLine.title = listenerError != nil ? (connectionStatus() ?? "") : ""
+        connLine.isHidden = listenerError == nil
         forgetItem.isHidden = pairedPCName == nil
-
+        forgetItem.title = pairedPCName.map { "Forget \($0)…" } ?? "Forget This PC…"
         warningLine.isHidden = !(remoteMode && secureInputOn)
-        warningLine.title = "⚠︎ Secure Input is on in another app; keys stay on this Mac"
-
         accessibilityItem.isHidden = accessibilityGranted
-        if !accessibilityGranted { modeLine.title = "Needs Accessibility permission" }
 
-        toggleItem.title = (remoteMode ? "Switch to Local Mode" : "Switch to Windows Mode")
-            + "   " + settings.hotkey.displayString
+        toggleItem.title = remoteMode ? "Switch to Local Mode" : "Switch to Windows Mode"
+        if let key = settings.hotkey.menuKeyEquivalent {
+            toggleItem.keyEquivalent = key.key
+            toggleItem.keyEquivalentModifierMask = key.modifiers
+        } else {
+            toggleItem.keyEquivalent = ""
+            toggleItem.title += "   " + settings.hotkey.displayString
+        }
         updateLoginItem()
+    }
+
+    /// Header: what the keyboard is typing on, and the paired PC's connection.
+    private func updateMenuHeader() {
+        let title: String
+        let symbol: String
+        if !accessibilityGranted {
+            title = "Needs Accessibility permission"
+            symbol = "lock"
+        } else if remoteMode && secureInputOn {
+            title = "Keys are staying on this Mac"
+            symbol = "exclamationmark.triangle"
+        } else if remoteMode {
+            title = "Typing on your PC"
+            symbol = "pc"
+        } else {
+            title = "Typing on this Mac"
+            symbol = "keyboard"
+        }
+
+        let subtitle: String
+        let dot: MenuHeaderView.Dot
+        let c = settingsConnection
+        let name = pairedPCName ?? c.host ?? "Windows PC"
+        switch c.state {
+        case .error:
+            subtitle = "\(name) · Can’t accept connections"
+            dot = .red
+        case .connected:
+            subtitle = "\(name) · Connected" + (c.latency.map { " · \($0)" } ?? "")
+            dot = .green
+        case .notConnected:
+            subtitle = "\(name) · Not connected"
+            dot = .gray
+        case .notPaired:
+            subtitle = "No PC paired"
+            dot = .gray
+        }
+        menuHeader.update(title: title, subtitle: subtitle, symbol: symbol,
+                          active: remoteMode && accessibilityGranted, dot: dot)
     }
 
     @objc private func onToggle() { toggle() }
@@ -554,15 +604,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Settin
         NSApp.mainMenu = main
     }
 
-    private func info(_ title: String) -> NSMenuItem {
+    private func info(_ title: String, symbol: String? = nil) -> NSMenuItem {
         let i = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         i.isEnabled = false
+        i.image = symbol.flatMap(NSMenuItem.symbolImage)
         return i
     }
 
-    private func item(_ title: String, _ action: Selector) -> NSMenuItem {
+    private func item(_ title: String, _ action: Selector, symbol: String? = nil) -> NSMenuItem {
         let i = NSMenuItem(title: title, action: action, keyEquivalent: "")
         i.target = self
+        i.image = symbol.flatMap(NSMenuItem.symbolImage)
         return i
     }
 
@@ -593,6 +645,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Settin
         capture.hotkey = settings.hotkey
         capture.swapCommandControl = settings.swapCommandControl
         updater.applySchedule()
+        server?.clipboardEnabled = settings.shareClipboard  // starts/stops clipboard polling
         updateUI()
     }
 
@@ -624,6 +677,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Settin
     func settingsCancelHotkeyRecording() { capture.onRecordHotkey = nil }
     var settingsPairedName: String? { pairedPCName }
     var settingsConnectionStatus: String { connectionStatus() ?? "" }
+
+    var settingsConnection: SettingsConnectionInfo {
+        if let err = listenerError {
+            return SettingsConnectionInfo(state: .error, detail: "Can’t accept connections on port \(KBP2.port): \(err)")
+        }
+        if let host = server?.peerHost {
+            return SettingsConnectionInfo(state: .connected, host: host,
+                                          latency: server?.roundTrip.map(Self.formatLatency))
+        }
+        return SettingsConnectionInfo(state: pairedPCName == nil ? .notPaired : .notConnected)
+    }
+
+    func settingsCheckForUpdates() { updater.checkNow() }
 
     var settingsLaunchAtLoginState: NSControl.StateValue {
         switch SMAppService.mainApp.status {

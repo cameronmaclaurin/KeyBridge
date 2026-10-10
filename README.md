@@ -43,7 +43,7 @@ flowchart LR
 
 The Mac app listens on TCP port 9876 and the Windows app connects to it. In **Local mode** your keyboard works normally. Press the hotkey to switch to **Windows mode**: each key press and release is encrypted and sent to the PC, which types it. Press the hotkey again to switch back.
 
-- **Keyboard only.** No mouse sharing. Both computers must be on the same local network.
+- **Keyboard and clipboard.** Copy text on one computer and paste it on the other. No mouse sharing. Both computers must be on the same local network.
 - **Finds your Mac for you.** The Mac announces itself on your network with Bonjour, so the PC lists it by name. You can still type an address.
 - **Native and small.** Swift/AppKit on the Mac (a ~300 KB universal app, under 20 MB of memory when measured). C/Win32 on Windows (one exe, no runtime).
 - **Low latency.** `TCP_NODELAY` is on, and each key event is one 20-byte encrypted record. Most of the delay you feel comes from your network, so wired Ethernet or 5 GHz Wi-Fi works best.
@@ -56,6 +56,8 @@ The Mac app listens on TCP port 9876 and the Windows app connects to it. In **Lo
 | Pairing window: compare a 6-digit number and click **Confirm** | The same 6-digit number to compare and **Confirm** |
 | Launch at Login | Start with Windows |
 | A warning when macOS Secure Input blocks key capture | Reconnects automatically |
+| Shared clipboard: copy here, paste on the PC | Shared clipboard: copy here, paste on the Mac |
+| Settings window (KeyBridge menu → **Settings…**) | Settings window (tray menu → **Settings…**) |
 
 ## Install & set up
 
@@ -81,7 +83,7 @@ Pairing works like pairing a Bluetooth keyboard: there's no code to type. If you
 1. On the Mac, click the KeyBridge icon in the menu bar and choose **Pair a Windows PC…**. Keep this window open while you pair.
 2. On the PC, open the KeyBridge setup window, pick your Mac from the list and click **Pair**. If your Mac isn't listed, type the address shown in the Mac's Pairing window instead (such as `Your-Mac.local` or `192.168.1.20`).
 3. Both screens now show a 6-digit number, such as **482 913**. **Check that the two numbers are the same**, then click **Confirm** on the Mac and on the PC. If they're different, click **Cancel** ([why](#the-numbers-dont-match)).
-4. Optional: turn on **Start with Windows**.
+4. Optional: turn on **Start with Windows** in the tray menu → **Settings…**.
 
 When the PC connects, the Windows tray icon turns from gray to color. That's it. Press <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>&#96;</kbd> on the Mac and start typing on the PC.
 
@@ -103,7 +105,17 @@ The Mac's Pairing window accepts a PC for 3 minutes. If that runs out, click **S
 
 The KeyBridge menu on the Mac also shows the current mode, the connection status and the live round-trip latency to the PC (for example `PC connected: 192.168.1.20 · 3 ms`).
 
-**Settings** (KeyBridge menu → **Settings…**): change the switch shortcut, swap <kbd>⌘</kbd> and <kbd>⌃</kbd> on Windows, play a sound when switching, turn notifications off, launch at login, and see or forget the paired PC.
+**Shared clipboard:** copy text on one computer and paste it on the other. It works both ways (Mac to PC and PC to Mac) while the two are connected, and it's on by default.
+
+- **Text only**, up to about 1 MB per copy. Images, files and formatting aren't shared. Larger text stays on the computer where you copied it.
+- **Only new copies.** What's already on the clipboard when the PC connects isn't sent. Only what you copy while connected is shared.
+- **Password managers' copies aren't shared.** Apps that mark what they copy as confidential or temporary are skipped, and most password managers do this.
+- **Turn it off** on either computer: Mac **Settings… → Clipboard**, or on the PC, tray menu → **Settings…**, then untick **Share clipboard**. Turning it off on either side stops sharing in both directions.
+
+**Settings.** Both apps have a redesigned Settings window.
+
+- **Mac** (KeyBridge menu → **Settings…**): change the switch shortcut, swap <kbd>⌘</kbd> and <kbd>⌃</kbd> on Windows, share the clipboard, play a sound when switching, turn notifications off, launch at login, check for updates automatically, and see or forget the paired PC.
+- **Windows** (tray menu → **Settings…**): share the clipboard, start with Windows, and check for updates automatically. These options used to be ticks in the tray menu; they've moved to the Settings window.
 
 **Key mapping**
 
@@ -124,7 +136,7 @@ KeyBridge keeps itself up to date (from v1.4.0 on). Both apps check GitHub for a
 - **Mac:** click **Install Update**. The installer opens; click through it and enter your password. KeyBridge restarts on the new version.
 - **Windows:** click **Install Update**. It installs silently and restarts KeyBridge. The portable exe can't update itself, so it opens the download page instead.
 - **Check now:** **Check for Updates…** in the Mac menu or the Windows tray menu.
-- **Turn it off:** **Automatically check for updates** in the Mac's Settings, or the Windows tray menu.
+- **Turn it off:** untick **Automatically check for updates** in Settings on the Mac or on the PC (tray menu → **Settings…**).
 
 Updates are signed. Each release publishes a small manifest signed with a key that only the release build has. The apps refuse any update whose signature, size or SHA-256 doesn't match, even if it came from GitHub. Details: [`docs/UPDATES.md`](docs/UPDATES.md).
 
@@ -135,7 +147,7 @@ Release builds of the Mac app are signed with KeyBridge's own long-lived certifi
 - **Pairing with no secret to type.** The Mac and the PC agree on a new random key with an ECDH P-256 exchange, as Bluetooth does. After that, both sides prove they hold that key before any keystroke is sent. A device that isn't paired can't receive your typing or inject keys into your PC.
 - **The 6-digit number stops eavesdroppers.** If another device on your network tried to get in the middle of pairing, the two screens would show different numbers. Each attempt has a 1 in 1,000,000 chance of matching by luck, and every attempt needs you to click Confirm on both computers. So do compare the numbers. They aren't secret, and you never type them.
 - **Pairing only when you ask.** The Mac accepts a new PC only while its Pairing window is open, for up to 3 minutes. The PC pairs only when you click Pair.
-- **Encryption.** Every keystroke is encrypted and authenticated with AES-256-GCM.
+- **Encryption.** Every keystroke and every shared clipboard text is encrypted and authenticated with AES-256-GCM, and goes only to your paired computer.
 - **Forward secrecy.** Each connection uses fresh keys from another ECDH P-256 exchange, so recorded traffic stays secret even if the pairing key leaks later.
 - **No stuck keys.** Held keys are released when you switch modes or the connection drops.
 
@@ -213,6 +225,18 @@ When a password field is focused, or an app such as Terminal has *Secure Keyboar
 </details>
 
 <details>
+<summary><strong>Copy and paste doesn't work between the computers</strong></summary>
+
+- Check that the PC is **connected**: the Windows tray icon is in color, and the Mac's KeyBridge menu says *PC connected*.
+- Check that **Share clipboard** is on in **both** apps' Settings. If it's off on either computer, nothing is shared in either direction.
+- Copy the text **again** after connecting. What was on the clipboard before the PC connected isn't sent.
+- Only **plain text up to about 1 MB** is shared. Images, files and very long text stay where you copied them.
+- Text copied from a **password manager** (or any app that marks a copy as confidential) is never shared, on purpose.
+- Both computers need **KeyBridge 1.5 or later**. Older versions don't share the clipboard. Update both.
+
+</details>
+
+<details>
 <summary><strong>Windows says "Windows protected your PC"</strong></summary>
 
 That's SmartScreen warning about an unsigned app. Click **More info → Run anyway**. To confirm the file is genuine first, [verify your download](#verify-your-download).
@@ -240,7 +264,7 @@ iscc /DAppVersion=1.1.0 windows\installer.iss
 ## FAQ
 
 **Does it share the mouse too?**
-Not yet. KeyBridge is keyboard only.
+Not yet. KeyBridge shares the keyboard and the clipboard (text only), not the mouse.
 
 **Does it work over the internet?**
 No. It only works on your local network, by design.

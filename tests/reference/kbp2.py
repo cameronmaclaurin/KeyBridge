@@ -13,7 +13,39 @@ Roles (docs/PROTOCOL.md Appendix A):
   pair-server  A.3 pairing responder    kbp2.py pair-server --port P --name NAME [--confirm yes|no]
   pair-client  A.4 pairing initiator    kbp2.py pair-client --host H --port P --name NAME [--confirm yes|no]
 
+Clipboard (spec 5a, A.1/A.2), for both server and client:
+
+  --clip-file PATH    send the file's bytes as one clipboard transfer (16384-byte
+                      chunks, transfer_id 0) once the peer's CAPS has bit0 set.
+                      The bytes are sent as they are (no UTF-8 check), so a test
+                      can send anything; a file over 1,048,576 bytes is not sent
+                      at all (spec 5a) unless --clip-ignore-limit is given.
+  Received transfers are printed as  CLIP <byte length> <sha256 hex>.
+
+Compatibility options (not part of the spec; used by tests/interop/):
+
+  --caps N            advertise CAPS b1 = N instead of 1 (0 = "sharing off"; the
+                      reference then sends no DATA itself).
+  --no-caps           never send CAPS, like a v1.4 peer.
+      In both cases the reference still decodes and prints any transfer it
+      receives, so a test can see a peer that sent DATA it should not have.
+
 Negative-test options (not part of the spec; used by tests/interop/):
+
+  server|client, each needs --clip-file (at most one of them):
+  --clip-ignore-limit   send the file even if it is over 1,048,576 bytes.
+      A correct receiver discards the transfer (no CLIP line).
+  --clip-no-first       clear the `first` flag on the transfer's first chunk.
+      A correct receiver discards every chunk of it (no CLIP line).
+  --clip-wrong-id       right after the first chunk, insert a stray chunk with
+      flags `last` and transfer_id 1 (the real transfer uses 0). A correct
+      receiver discards the stray chunk and prints the file's normal CLIP line.
+      (Use a file longer than 16384 bytes, so the transfer is still in progress.)
+  --clip-invalid-utf8   insert a 0xFF byte in the middle of the file's bytes.
+      A correct receiver discards the transfer (no CLIP line).
+  --clip-corrupt-chunk  flip one tag bit in the first sealed chunk, then send
+      no more chunks. A correct receiver closes the connection at once.
+
 
   client --corrupt-finished   complete the handshake but send a wrong ClientFinished.
   client --bad-magic          send a ClientHello whose magic is not "KBR2".
@@ -63,6 +95,7 @@ import hashlib
 import hmac
 import os
 import re
+import select
 import socket
 import sys
 import time
@@ -126,12 +159,27 @@ TYPE_KEY = 0x01
 TYPE_PING = 0x02
 TYPE_PONG = 0x03
 TYPE_RELEASE_ALL = 0x04
+TYPE_DATA = 0x05
+TYPE_CAPS = 0x06
 
 FLAG_DOWN = 0x01
 FLAG_EXTENDED = 0x02
 
+# Capabilities and data (spec 5a)
+CAP_CLIPBOARD_TEXT = 0x01  # CAPS b1 bit0: "I can receive clipboard text"
+CHUNK_HEADER_LEN = 4  # kind(1) || flags(1) || transfer_id(2)
+CHUNK_PAYLOAD_MAX = 16384
+CHUNK_MIN = CHUNK_HEADER_LEN + 1  # 5: N in the DATA header
+CHUNK_MAX = CHUNK_HEADER_LEN + CHUNK_PAYLOAD_MAX  # 16388
+KIND_CLIPBOARD_TEXT = 0x01
+CHUNK_FIRST = 0x01
+CHUNK_LAST = 0x02
+CLIP_MAX = 1_048_576  # bytes of UTF-8 per transfer
+
 LIVENESS_TIMEOUT = 6.0  # seconds without any record
 PONG_WAIT = 3.0  # A.1: wait up to 3 s for a PONG
+CLIP_GRACE = 1.0  # A.1: after the PONG, at most 1 s more for a transfer in progress
+CAPS_WAIT = 2.0  # A.1 step 4a: how long the server waits for the client's CAPS (not in the spec)
 
 # A.1: the records the selftest server sends after authentication.
 SELFTEST_KEYS = [  # (flags, vk)
@@ -520,7 +568,8 @@ class RecordError(Exception):
 
 
 class RecordLayer:
-    """Fixed 20-byte AES-256-GCM records with per-direction 64-bit counters."""
+    """Fixed 20-byte AES-256-GCM records with per-direction 64-bit counters (spec 5),
+    plus the variable-length sealed chunk that follows each DATA header (spec 5a)."""
 
     def __init__(self, sock: socket.socket, send_key: bytes, recv_key: bytes):
         self.sock = sock
@@ -544,28 +593,225 @@ class RecordLayer:
         self.sock.settimeout(HANDSHAKE_TIMEOUT)  # recv() may have left a tiny timeout behind
         self.sock.sendall(self.seal(bytes([type_, b1, b2, b3])))
 
-    def recv(self, timeout: float | None) -> bytes | None:
-        """Next plaintext, or None if the peer closed cleanly on a record boundary.
+    def send_data(self, chunk: bytes, corrupt: bool = False) -> None:
+        """Spec 5a: a DATA header (one seq) immediately followed by the sealed chunk (the next seq).
 
-        Raises RecordError (bad tag / truncated) and TimeoutError.
+        Both go out in one sendall, so nothing can come between them.
+        corrupt=True flips one tag bit of the sealed chunk (negative tests).
         """
-        deadline = None if timeout is None else time.monotonic() + timeout
+        n = len(chunk)
+        assert CHUNK_MIN <= n <= CHUNK_MAX
+        header = self.seal(bytes([TYPE_DATA, (n >> 16) & 0xFF, (n >> 8) & 0xFF, n & 0xFF]))
+        sealed = self._send.encrypt(self.nonce(self.send_seq), chunk, None)
+        self.send_seq += 1
+        assert len(sealed) == n + RECORD_TAG_LEN
+        if corrupt:
+            sealed = sealed[:-1] + bytes([sealed[-1] ^ 0x01])
+        self.sock.settimeout(HANDSHAKE_TIMEOUT)
+        self.sock.sendall(header + sealed)
+
+    def readable(self, timeout: float) -> bool:
+        """True if a byte (or EOF) can be read within `timeout` seconds. Consumes nothing."""
+        ready, _, _ = select.select([self.sock], [], [], max(0.0, timeout))
+        return bool(ready)
+
+    def _open(self, sealed: bytes, what: str) -> bytes:
+        try:
+            plaintext = self._recv.decrypt(self.nonce(self.recv_seq), sealed, None)
+        except InvalidTag:
+            raise RecordError(f"{what} {self.recv_seq} failed authentication") from None
+        self.recv_seq += 1
+        return plaintext
+
+    def recv(self, timeout: float | None) -> bytes | None:
+        """Next message, or None if the peer closed cleanly on a record boundary.
+
+        A message is the 4-byte record plaintext; for DATA it is the header's 4 bytes
+        followed by the chunk plaintext. Waits up to `timeout` for the message to
+        start (TimeoutError, nothing consumed); once it has started, the rest must
+        arrive within HANDSHAKE_TIMEOUT. Raises RecordError on a bad tag, a bad
+        chunk length or a truncated record/chunk: the caller must close.
+        """
+        if timeout is not None and not self.readable(timeout):
+            raise TimeoutError(f"nothing received for {timeout:.1f} s")
+        deadline = time.monotonic() + HANDSHAKE_TIMEOUT
         try:
             record = recv_exact(self.sock, RECORD_LEN, deadline)
         except PeerClosed as exc:
             if exc.received == 0:
                 return None
             raise RecordError(f"truncated record: {exc}") from None
+        except TimeoutError as exc:
+            raise RecordError(f"stalled inside a record: {exc}") from None
+        plaintext = self._open(record, "record")
+        if plaintext[0] != TYPE_DATA:
+            return plaintext
+
+        # Spec 5a: the sealed chunk follows immediately and uses the next seq.
+        n = int.from_bytes(plaintext[1:4], "big")
+        if not CHUNK_MIN <= n <= CHUNK_MAX:
+            raise RecordError(f"DATA header announces a {n}-byte chunk (allowed {CHUNK_MIN}..{CHUNK_MAX})")
         try:
-            plaintext = self._recv.decrypt(self.nonce(self.recv_seq), record, None)
-        except InvalidTag:
-            raise RecordError(f"record {self.recv_seq} failed authentication") from None
-        self.recv_seq += 1
-        return plaintext
+            sealed = recv_exact(self.sock, n + RECORD_TAG_LEN, deadline)
+        except (PeerClosed, TimeoutError) as exc:
+            raise RecordError(f"truncated DATA chunk: {exc}") from None
+        return plaintext + self._open(sealed, "DATA chunk")
 
 
 def key_record(flags: int, vk: int) -> tuple[int, int, int, int]:
     return (TYPE_KEY, flags, vk & 0xFF, (vk >> 8) & 0xFF)
+
+
+# ---------------------------------------------------------------------------
+# Clipboard transfers (spec 5a)
+# ---------------------------------------------------------------------------
+
+
+def clip_line(text: bytes) -> str:
+    """A.1/A.2 stdout line for a completed clipboard transfer."""
+    return f"CLIP {len(text)} {hashlib.sha256(text).hexdigest()}"
+
+
+def make_chunk(flags: int, transfer_id: int, payload: bytes, kind: int = KIND_CLIPBOARD_TEXT) -> bytes:
+    """Chunk plaintext = kind(1) || flags(1) || transfer_id(2, big-endian) || payload."""
+    return bytes([kind, flags]) + (transfer_id & 0xFFFF).to_bytes(2, "big") + payload
+
+
+def clip_chunks(text: bytes, transfer_id: int) -> list[bytes]:
+    """Split one transfer into chunks of at most 16384 payload bytes with first/last flags.
+
+    Empty text gives no chunks: a chunk carries at least one payload byte (N >= 5).
+    """
+    pieces = [text[i : i + CHUNK_PAYLOAD_MAX] for i in range(0, len(text), CHUNK_PAYLOAD_MAX)]
+    chunks = []
+    for index, piece in enumerate(pieces):
+        flags = (CHUNK_FIRST if index == 0 else 0) | (CHUNK_LAST if index == len(pieces) - 1 else 0)
+        chunks.append(make_chunk(flags, transfer_id, piece))
+    return chunks
+
+
+class ClipReceiver:
+    """Reassembly rules of spec 5a. feed() returns the complete text, or None."""
+
+    def __init__(self) -> None:
+        self.active = False  # saw a `first` and no `last` yet (A.1: "a transfer in progress")
+        self.transfer_id: int | None = None
+        self.buffer: bytearray | None = None  # None while an oversized transfer is being ignored
+
+    def feed(self, chunk: bytes) -> bytes | None:
+        kind, flags = chunk[0], chunk[1]
+        transfer_id = int.from_bytes(chunk[2:4], "big")
+        payload = chunk[CHUNK_HEADER_LEN:]
+        if kind != KIND_CLIPBOARD_TEXT:
+            log(f"ignoring a DATA chunk of unknown kind 0x{kind:02x}")  # decrypted already, so still in sync
+            return None
+        if flags & CHUNK_FIRST:
+            if self.active:
+                log(f"transfer {transfer_id} starts; abandoning unfinished transfer {self.transfer_id}")
+            self.active, self.transfer_id, self.buffer = True, transfer_id, bytearray()
+        elif not self.active or transfer_id != self.transfer_id:
+            log(f"discarding a chunk of transfer {transfer_id}: that transfer is not in progress")
+            return None
+        if self.buffer is not None and len(self.buffer) + len(payload) > CLIP_MAX:
+            log(f"transfer {transfer_id} exceeds {CLIP_MAX} bytes; discarding it")
+            self.buffer = None  # ignore its chunks until the next `first`
+        if self.buffer is not None:
+            self.buffer += payload
+        if not flags & CHUNK_LAST:
+            return None
+        self.active = False
+        text, self.buffer = self.buffer, None
+        if text is None:
+            return None
+        try:
+            bytes(text).decode("utf-8")
+        except UnicodeDecodeError:
+            log(f"discarding transfer {transfer_id}: not valid UTF-8")
+            return None
+        return bytes(text)
+
+
+def send_clip(records: RecordLayer, args: argparse.Namespace, transfer_id: int, between) -> None:
+    """Send args.clip_file as one transfer (spec 5a), applying any --clip-* negative option.
+
+    between() runs after each header+chunk pair (the sender "yields", so the
+    peer's records are read and answered); it returns False once the peer closed.
+    """
+    text = args.clip_file
+    if args.clip_invalid_utf8:
+        middle = len(text) // 2
+        text = text[:middle] + b"\xff" + text[middle:]
+        log("negative test: the transfer contains a 0xFF byte (invalid UTF-8)")
+    if not text:
+        log("--clip-file is empty: nothing to send (a chunk carries at least one byte)")
+        return
+    if len(text) > CLIP_MAX and not args.clip_ignore_limit:
+        log(f"--clip-file is {len(text)} bytes, over {CLIP_MAX}: not sent (spec 5a)")
+        return
+    for index, chunk in enumerate(clip_chunks(text, transfer_id)):
+        if index == 0 and args.clip_no_first:
+            chunk = chunk[:1] + bytes([chunk[1] & ~CHUNK_FIRST]) + chunk[2:]
+            log("negative test: the first chunk has no `first` flag")
+        corrupt = index == 0 and args.clip_corrupt_chunk
+        records.send_data(chunk, corrupt=corrupt)
+        if corrupt:
+            log("negative test: sent DATA chunk 0 with a flipped tag bit")
+            return  # the peer must close now
+        if index == 0 and args.clip_wrong_id:
+            records.send_data(make_chunk(CHUNK_LAST, transfer_id + 1, b"stray chunk"))
+            log(f"negative test: inserted a stray `last` chunk with transfer_id {transfer_id + 1}")
+        if not between():
+            log("peer closed during the transfer")
+            return
+
+
+def may_send_clip(args: argparse.Namespace, peer_caps: int | None) -> bool:
+    """Spec 5a: send DATA only if the peer advertised clipboard text and sharing is on here."""
+    sharing_on = not args.no_caps and bool(args.caps & CAP_CLIPBOARD_TEXT)
+    return args.clip_file is not None and sharing_on and peer_caps is not None and bool(peer_caps & CAP_CLIPBOARD_TEXT)
+
+
+class Peer:
+    """Record dispatch shared by the selftest server and client."""
+
+    def __init__(self, records: RecordLayer, on_record):
+        self.records = records
+        self.on_record = on_record  # called with each non-DATA plaintext
+        self.clip = ClipReceiver()
+        self.caps: int | None = None  # the peer's CAPS b1, once received
+        self.closed = False
+
+    def handle(self, message: bytes | None) -> None:
+        if message is None:
+            self.closed = True
+            return
+        if message[0] == TYPE_DATA:
+            text = self.clip.feed(message[RECORD_PLAINTEXT_LEN:])
+            if text is not None:
+                out(clip_line(text))
+            return
+        if message[0] == TYPE_CAPS:
+            self.caps = message[1]
+        self.on_record(message)
+
+    def pump(self, until, timeout: float) -> None:
+        """Read and handle messages until until() is true, the peer closes, or `timeout` passes."""
+        deadline = time.monotonic() + timeout
+        while not until() and not self.closed:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                message = self.records.recv(remaining)
+            except TimeoutError:
+                return
+            self.handle(message)
+
+    def drain(self) -> bool:
+        """Handle whatever has already arrived, without waiting. False once the peer closed."""
+        while not self.closed and self.records.readable(0):
+            self.handle(self.records.recv(None))
+        return not self.closed
 
 
 # ---------------------------------------------------------------------------
@@ -584,49 +830,55 @@ def run_server(args: argparse.Namespace) -> int:
     log("handshake ok")
 
     records = RecordLayer(conn, send_key=keys.k_s2c, recv_key=keys.k_c2s)
+    pong = []
+    peer = Peer(records, lambda message: pong.append(True) if message[0] == TYPE_PONG else None)
     try:
-        for index, (flags, vk) in enumerate(SELFTEST_KEYS):
-            record = records.seal(bytes(key_record(flags, vk)))
-            if index == 0 and args.tamper_record:
-                record = record[:-1] + bytes([record[-1] ^ 0x01])
-                log("negative test: sent KEY record 0 with a flipped tag bit")
-            conn.sendall(record)
-            if index == 0 and args.replay_record:
+        try:
+            # 0. CAPS, the first record after authentication (spec 5a).
+            if not args.no_caps:
+                records.send(TYPE_CAPS, args.caps)
+            # 1.-4. KEY records.
+            for index, (flags, vk) in enumerate(SELFTEST_KEYS):
+                record = records.seal(bytes(key_record(flags, vk)))
+                if index == 0 and args.tamper_record:
+                    record = record[:-1] + bytes([record[-1] ^ 0x01])
+                    log("negative test: sent KEY record 0 with a flipped tag bit")
                 conn.sendall(record)
-                log("negative test: replayed KEY record 0")
-        records.send(TYPE_PING)
-    except OSError as exc:
-        log(f"peer went away while sending: {exc}")
+                if index == 0 and args.replay_record:
+                    conn.sendall(record)
+                    log("negative test: replayed KEY record 0")
+            # 4a. The clipboard transfer, once the client's CAPS says it can receive it.
+            if args.clip_file is not None and may_send_clip(args, CAP_CLIPBOARD_TEXT):
+                peer.pump(lambda: peer.caps is not None, CAPS_WAIT)
+                if may_send_clip(args, peer.caps):
+                    send_clip(records, args, transfer_id=0, between=peer.drain)
+                else:
+                    log(f"client CAPS is {peer.caps}: no clipboard transfer")
+            # 5. PING.
+            records.send(TYPE_PING)
+        except OSError as exc:
+            log(f"peer went away while sending: {exc}")
 
-    got_pong = False
-    deadline = time.monotonic() + PONG_WAIT
-    try:
-        while not got_pong:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            plaintext = records.recv(remaining)
-            if plaintext is None:
-                log("peer closed before PONG")
-                break
-            if plaintext[0] == TYPE_PONG:
-                got_pong = True
-            # Unknown types are ignored.
-    except TimeoutError:
-        log("no PONG within 3 s")
+        # Wait up to 3 s for the PONG, then at most 1 s more for a transfer in progress.
+        try:
+            peer.pump(lambda: bool(pong), PONG_WAIT)
+            if pong and peer.clip.active:
+                peer.pump(lambda: not peer.clip.active, CLIP_GRACE)
+        except OSError as exc:
+            log(f"socket error waiting for PONG: {exc}")
     except RecordError as exc:
         log(f"closing: {exc}")
         conn.close()
         return EXIT_NO_PONG
-    except OSError as exc:
-        log(f"socket error waiting for PONG: {exc}")
+    if not pong:
+        log("peer closed before PONG" if peer.closed else f"no PONG within {PONG_WAIT:.0f} s")
 
     try:
         records.send(TYPE_RELEASE_ALL)
     except OSError as exc:
         log(f"could not send RELEASE_ALL: {exc}")
     graceful_close(conn)
-    return EXIT_OK if got_pong else EXIT_NO_PONG
+    return EXIT_OK if pong else EXIT_NO_PONG
 
 
 # ---------------------------------------------------------------------------
@@ -636,7 +888,9 @@ def run_server(args: argparse.Namespace) -> int:
 
 def format_event(plaintext: bytes) -> str | None:
     """A.2 stdout line for a received record, or None if it is ignored."""
-    type_, b1, b2, b3 = plaintext
+    type_, b1, b2, b3 = plaintext[:RECORD_PLAINTEXT_LEN]
+    if type_ == TYPE_CAPS:
+        return f"CAPS {b1}"
     if type_ == TYPE_KEY:
         vk = b2 | (b3 << 8)
         if not 1 <= vk <= 254:
@@ -704,21 +958,10 @@ def client_session(sock: socket.socket, psk: bytes, args: argparse.Namespace) ->
     out("HANDSHAKE OK")
 
     records = RecordLayer(sock, send_key=keys.k_c2s, recv_key=keys.k_s2c)
-    while True:
-        try:
-            plaintext = records.recv(LIVENESS_TIMEOUT)
-        except TimeoutError:
-            log(f"no record for {LIVENESS_TIMEOUT:.0f} s, closing")
-            return EXIT_ERROR
-        except RecordError as exc:
-            log(f"closing: {exc}")
-            return EXIT_ERROR
-        except OSError as exc:
-            log(f"socket error: {exc}")
-            return EXIT_ERROR
-        if plaintext is None:
-            out("CLOSED")
-            return EXIT_OK
+    clip_sent = False
+
+    def on_record(plaintext: bytes) -> None:
+        nonlocal clip_sent
         line = format_event(plaintext)
         if line is not None:
             out(line)
@@ -727,6 +970,31 @@ def client_session(sock: socket.socket, psk: bytes, args: argparse.Namespace) ->
                 records.send(TYPE_PONG)
             except OSError as exc:
                 log(f"could not send PONG: {exc}")
+        elif plaintext[0] == TYPE_CAPS and not clip_sent and may_send_clip(args, peer.caps):
+            clip_sent = True  # A.2: one transfer, right after the server's CAPS arrives
+            try:
+                send_clip(records, args, transfer_id=0, between=peer.drain)
+            except OSError as exc:
+                log(f"could not send the clipboard transfer: {exc}")
+
+    peer = Peer(records, on_record)
+    try:
+        # Spec 5a: CAPS is the client's first record, right after ClientFinished.
+        if not args.no_caps:
+            records.send(TYPE_CAPS, args.caps)
+        while not peer.closed:
+            peer.handle(records.recv(LIVENESS_TIMEOUT))
+    except TimeoutError:  # before OSError: TimeoutError is an OSError
+        log(f"no record for {LIVENESS_TIMEOUT:.0f} s, closing")
+        return EXIT_ERROR
+    except RecordError as exc:
+        log(f"closing: {exc}")
+        return EXIT_ERROR
+    except OSError as exc:
+        log(f"socket error: {exc}")
+        return EXIT_ERROR
+    out("CLOSED")
+    return EXIT_OK
 
 
 # ---------------------------------------------------------------------------
@@ -904,6 +1172,40 @@ class Parser(argparse.ArgumentParser):
         self.exit(EXIT_USAGE, f"{self.prog}: error: {message}\n")
 
 
+def read_clip_file(path: str) -> bytes:
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError as exc:
+        raise argparse.ArgumentTypeError(f"cannot read --clip-file: {exc}") from None
+
+
+def caps_byte(text: str) -> int:
+    try:
+        value = int(text, 0)
+    except ValueError:
+        value = -1
+    if not 0 <= value <= 255:
+        raise argparse.ArgumentTypeError(f"--caps must be 0..255, got {text!r}")
+    return value
+
+
+CLIP_NEGATIVE = ("clip_ignore_limit", "clip_no_first", "clip_wrong_id", "clip_invalid_utf8", "clip_corrupt_chunk")
+
+
+def add_clip_options(role: argparse.ArgumentParser) -> None:
+    """Spec 5a / A.1 / A.2 clipboard options, shared by server and client."""
+    role.add_argument("--clip-file", type=read_clip_file, metavar="PATH", help="clipboard text to send (UTF-8 bytes)")
+    role.add_argument("--caps", type=caps_byte, default=CAP_CLIPBOARD_TEXT, help="CAPS b1 to advertise (default 1)")
+    role.add_argument("--no-caps", action="store_true", help="never send CAPS (behave like a v1.4 peer)")
+    neg = role.add_mutually_exclusive_group()
+    neg.add_argument("--clip-ignore-limit", action="store_true", help="send --clip-file even if over 1,048,576 bytes")
+    neg.add_argument("--clip-no-first", action="store_true", help="clear `first` on the first chunk")
+    neg.add_argument("--clip-wrong-id", action="store_true", help="insert a stray `last` chunk with transfer_id 1")
+    neg.add_argument("--clip-invalid-utf8", action="store_true", help="insert a 0xFF byte into the transfer")
+    neg.add_argument("--clip-corrupt-chunk", action="store_true", help="flip a tag bit in the first sealed chunk")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = Parser(description="KBP2 reference implementation (docs/PROTOCOL.md).")
     parser.add_argument("--debug", action="store_true", help="print key-schedule values to stderr")
@@ -915,6 +1217,7 @@ def build_parser() -> argparse.ArgumentParser:
     bad = server.add_mutually_exclusive_group()
     bad.add_argument("--tamper-record", action="store_true", help="flip a bit in the first KEY record")
     bad.add_argument("--replay-record", action="store_true", help="send the first KEY record twice")
+    add_clip_options(server)
 
     client = roles.add_parser("client", help="Appendix A.2 selftest client")
     client.add_argument("--host", default="127.0.0.1")
@@ -931,6 +1234,7 @@ def build_parser() -> argparse.ArgumentParser:
     neg.add_argument("--bad-magic", action="store_true", help="send a ClientHello with the wrong magic")
     neg.add_argument("--invalid-point", action="store_true", help="send a public key that is not on P-256")
     neg.add_argument("--stall", action="store_true", help="never send ClientFinished")
+    add_clip_options(client)
 
     pair_server = roles.add_parser("pair-server", help="Appendix A.3 pairing responder")
     pair_server.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -963,8 +1267,13 @@ ROLES = {
 
 def main(argv: list[str] | None = None) -> int:
     global DEBUG
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     DEBUG = args.debug
+    if args.role in ("server", "client") and args.clip_file is None:
+        for name in CLIP_NEGATIVE:
+            if getattr(args, name):
+                parser.error(f"--{name.replace('_', '-')} needs --clip-file")
     return ROLES[args.role](args)
 
 

@@ -6,17 +6,26 @@ global watchdog aborts the whole run, so a hung peer can never hang CI.
 
 from __future__ import annotations
 
+import atexit
+import hashlib
 import os
 import queue
 import re
 import secrets
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
 from typing import Callable
+
+# Windows consoles default to a legacy code page; test names contain → and non-ASCII text.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
@@ -29,6 +38,7 @@ import kbp2  # noqa: E402  (reference implementation; the self-check unit-tests 
 # from the reference, so a reference bug cannot hide behind itself).
 A2_TRANSCRIPT = [
     "HANDSHAKE OK",
+    "CAPS 1",
     "KEY down=1 ext=0 vk=0x0041",
     "KEY down=0 ext=0 vk=0x0041",
     "KEY down=1 ext=1 vk=0x000D",
@@ -37,6 +47,64 @@ A2_TRANSCRIPT = [
     "RELEASE_ALL",
     "CLOSED",
 ]
+
+# ---------------------------------------------------------------------------
+# Clipboard (spec 5a, A.1/A.2 --clip-file and CLIP lines)
+# ---------------------------------------------------------------------------
+
+CLIP_LIMIT = 1_048_576  # spec 5a: largest transfer, in bytes of UTF-8
+CHUNK = 16384  # spec 5a: payload bytes per chunk
+
+
+def clip_line(data: bytes) -> str:
+    """`CLIP <byte length> <sha256 hex lowercase>` (A.1/A.2), computed here, not by the reference."""
+    return f"CLIP {len(data)} {hashlib.sha256(data).hexdigest()}"
+
+
+def a2_with_clip(data: bytes | None, caps: int | None = 1) -> list[str]:
+    """The A.2 transcript with the server's CAPS value (None: no CAPS line) and a CLIP line before PING."""
+    lines = [line for line in A2_TRANSCRIPT if not line.startswith("CAPS")]
+    if caps is not None:
+        lines.insert(1, f"CAPS {caps}")
+    if data is not None:
+        lines.insert(lines.index("PING"), clip_line(data))
+    return lines
+
+
+def _lines_of_text(size: int) -> bytes:
+    """`size` bytes of numbered ASCII lines, so a mix-up between chunks changes the hash."""
+    out = bytearray()
+    n = 0
+    while len(out) < size:
+        n += 1
+        out += f"{n:06d} The quick brown fox jumps over the lazy dog.\n".encode()
+    return bytes(out[:size])
+
+
+SMALL_TEXT = b"Hello from KeyBridge!\n"
+MULTI_CHUNK_TEXT = _lines_of_text(40 * 1024)  # 3 chunks: 16384 + 16384 + 8192
+NON_ASCII_TEXT = "Grüße aus Zürich 👋 こんにちは世界 你好，世界 한국어 🇬🇧 👩🏽‍💻 café ✓\n".encode()
+# More than one chunk, with a 4-byte emoji straddling the 16384-byte chunk boundary:
+# the text must be validated after reassembly, not chunk by chunk.
+NON_ASCII_SPLIT_TEXT = (b"x" * (CHUNK - 2)) + "😀 漢字かな交じり文 🎌\n".encode() * 200
+LIMIT_TEXT = _lines_of_text(CLIP_LIMIT)  # exactly 1,048,576 bytes: accepted
+OVER_LIMIT_TEXT = _lines_of_text(CLIP_LIMIT + 1)  # 1,048,577 bytes: discarded / not sent
+assert NON_ASCII_SPLIT_TEXT[: CHUNK].decode("utf-8", "replace").endswith("�")  # really split
+
+_clip_dir: str | None = None
+
+
+def clip_file(data: bytes) -> str:
+    """Write `data` to a temporary file (removed when the run ends) for --clip-file."""
+    global _clip_dir
+    if _clip_dir is None:
+        _clip_dir = tempfile.mkdtemp(prefix="kbp2-clip-")
+        atexit.register(shutil.rmtree, _clip_dir, True)
+    path = os.path.join(_clip_dir, hashlib.sha256(data).hexdigest()[:16] + ".txt")
+    if not os.path.exists(path):
+        with open(path, "wb") as f:
+            f.write(data)
+    return path
 
 # Appendix A.3/A.4 line shapes.
 SAS_LINE = re.compile(r"SAS (\d{6})")

@@ -82,6 +82,7 @@ final class AppSettings {
         static let swap = "swapCommandControl", sound = "playSwitchSound", notify = "showNotifications"
         static let autoUpdate = "autoCheckForUpdates", skippedUpdate = "skippedUpdateVersion"
         static let lastUpdateCheck = "lastUpdateCheck"
+        static let shareClipboard = "shareClipboard"
     }
 
     private init() {
@@ -92,6 +93,7 @@ final class AppSettings {
             K.sound: false,
             K.notify: true,
             K.autoUpdate: true,
+            K.shareClipboard: true,
         ])
     }
 
@@ -117,6 +119,12 @@ final class AppSettings {
     }
 
     /// docs/UPDATES.md §2: at launch (after 10 s) and every 24 h. Default on.
+    /// Share plain-text clipboard with the paired PC (docs/PROTOCOL.md §5a).
+    var shareClipboard: Bool {
+        get { d.bool(forKey: K.shareClipboard) }
+        set { d.set(newValue, forKey: K.shareClipboard); onChange?() }
+    }
+
     var autoCheckUpdates: Bool {
         get { d.bool(forKey: K.autoUpdate) }
         set { d.set(newValue, forKey: K.autoUpdate); onChange?() }

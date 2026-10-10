@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Reference vs the Windows selftest build (docs/PROTOCOL.md Appendix A.2 and A.4).
+"""Reference vs the Windows selftest build (docs/PROTOCOL.md Appendix A.2 and A.4,
+including the shared clipboard of section 5a).
 
 Build the selftest client first (Developer Command Prompt / vcvars64 loaded):
     windows\\build.bat 0.0.0 selftest
@@ -14,10 +15,19 @@ import sys
 
 from harness import (
     A2_TRANSCRIPT,
+    LIMIT_TEXT,
     LONG_NAME,
     MAC_NAME,
+    MULTI_CHUNK_TEXT,
+    NON_ASCII_SPLIT_TEXT,
+    NON_ASCII_TEXT,
+    OVER_LIMIT_TEXT,
     PC_NAME,
+    SMALL_TEXT,
     Checks,
+    a2_with_clip,
+    clip_file,
+    clip_line,
     free_port,
     new_psk,
     other_psk,
@@ -32,8 +42,8 @@ from harness import (
 EXE = ""
 
 
-def windows_client(port: int, psk: str) -> list[str]:
-    return [EXE, "--selftest-client", "--host", "127.0.0.1", "--port", str(port), "--psk", psk]
+def windows_client(port: int, psk: str, *extra: str) -> list[str]:
+    return [EXE, "--selftest-client", "--host", "127.0.0.1", "--port", str(port), "--psk", psk, *extra]
 
 
 def windows_pair_client(port: int, *extra: str, name: str = PC_NAME) -> list[str]:
@@ -45,11 +55,11 @@ def windows_pair_client(port: int, *extra: str, name: str = PC_NAME) -> list[str
 # ---------------------------------------------------------------------------
 
 
-def session(psk: str, client_psk: str | None = None, server_extra=()):
+def session(psk: str, client_psk: str | None = None, server_extra=(), client_extra=()):
     port = free_port()
     return run_pair(
         ref_server(port, psk, *server_extra),
-        windows_client(port, client_psk or psk),
+        windows_client(port, client_psk or psk, *client_extra),
         server_name="reference-server",
         client_name="windows-client",
     )
@@ -126,6 +136,102 @@ def test_psk_usage_error():
         c.procs += (proc,)
         c.exit_code(proc, 64)
     c.done()
+
+
+# ---------------------------------------------------------------------------
+# Clipboard (5a, A.2 --clip-file / CLIP): reference server <-> Windows client
+# ---------------------------------------------------------------------------
+
+
+def check_exe_receives(data: bytes, *extra: str, delivered: bool = True) -> None:
+    """Reference server --clip-file → the exe prints the A.2 transcript with a matching CLIP before PING (or none)."""
+    server, client = session(new_psk(), server_extra=["--clip-file", clip_file(data), *extra])
+    c = Checks(server, client)
+    c.exit_code(client, 0)
+    c.stdout_equals(client, a2_with_clip(data if delivered else None))
+    c.exit_code(server, 0)
+    c.done()
+
+
+def check_exe_sends(data: bytes, delivered: bool = True, server_extra=(), caps: int | None = 1) -> None:
+    """Exe --clip-file → the reference server prints a matching CLIP (or none)."""
+    server, client = session(new_psk(), server_extra=server_extra, client_extra=["--clip-file", clip_file(data)])
+    c = Checks(server, client)
+    c.exit_code(client, 0)
+    c.stdout_equals(client, a2_with_clip(None, caps=caps))
+    c.exit_code(server, 0)
+    c.stdout_equals(server, ["LISTENING"] + ([clip_line(data)] if delivered else []))
+    c.done()
+
+
+def test_clip_exe_receives_small():
+    check_exe_receives(SMALL_TEXT)
+
+
+def test_clip_exe_receives_multi_chunk():
+    check_exe_receives(MULTI_CHUNK_TEXT)
+
+
+def test_clip_exe_receives_non_ascii():
+    check_exe_receives(NON_ASCII_TEXT)
+    check_exe_receives(NON_ASCII_SPLIT_TEXT)  # an emoji straddles the 16384-byte chunk boundary
+
+
+def test_clip_exe_receives_1mib():
+    check_exe_receives(LIMIT_TEXT)
+
+
+def test_clip_exe_discards_over_limit():
+    check_exe_receives(OVER_LIMIT_TEXT, "--clip-ignore-limit", delivered=False)
+
+
+def test_clip_exe_discards_invalid_utf8():
+    check_exe_receives(MULTI_CHUNK_TEXT, "--clip-invalid-utf8", delivered=False)
+
+
+def test_clip_exe_discards_chunk_without_first():
+    check_exe_receives(MULTI_CHUNK_TEXT, "--clip-no-first", delivered=False)
+
+
+def test_clip_exe_ignores_stray_transfer_id():
+    check_exe_receives(MULTI_CHUNK_TEXT, "--clip-wrong-id")  # the stray chunk is dropped, the real text arrives
+
+
+def test_clip_exe_drops_corrupt_chunk():
+    server, client = session(new_psk(), server_extra=["--clip-file", clip_file(MULTI_CHUNK_TEXT), "--clip-corrupt-chunk"])
+    c = Checks(server, client)
+    c.terminated(client)
+    lines = [line.rstrip() for line in client.stdout]
+    c.require(lines[:6] == A2_TRANSCRIPT[:6], f"windows-client: expected {A2_TRANSCRIPT[:6]} before the bad chunk")
+    c.require(
+        not any(line.startswith(("CLIP", "PING", "RELEASE_ALL")) for line in lines),
+        "windows-client: accepted something after a corrupted chunk (it must close the connection)",
+    )
+    c.exit_code(server, 3)  # no PONG: the exe hung up at the bad chunk
+    c.done()
+
+
+def test_clip_exe_sends_small_and_non_ascii():
+    check_exe_sends(SMALL_TEXT)
+    check_exe_sends(NON_ASCII_TEXT)
+
+
+def test_clip_exe_sends_multi_chunk():
+    check_exe_sends(MULTI_CHUNK_TEXT)
+    check_exe_sends(NON_ASCII_SPLIT_TEXT)
+
+
+def test_clip_exe_sends_1mib():
+    check_exe_sends(LIMIT_TEXT)
+
+
+def test_clip_exe_does_not_send_over_limit():
+    check_exe_sends(OVER_LIMIT_TEXT, delivered=False)  # spec 5a: over 1,048,576 bytes is not sent at all
+
+
+def test_clip_exe_respects_peer_caps():
+    check_exe_sends(SMALL_TEXT, delivered=False, server_extra=["--caps", "0"], caps=0)  # sharing off on the Mac
+    check_exe_sends(SMALL_TEXT, delivered=False, server_extra=["--no-caps"], caps=None)  # a v1.4 Mac
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +317,20 @@ TESTS = [
     ("session tampered record: exe drops the connection", test_tampered_record),
     ("session replayed record: exe drops the connection", test_replayed_record),
     ("session malformed --psk: exit 64", test_psk_usage_error),
+    ("clipboard: reference --clip-file small → exe prints CLIP", test_clip_exe_receives_small),
+    ("clipboard: reference --clip-file 40 KB (3 chunks) → exe prints CLIP", test_clip_exe_receives_multi_chunk),
+    ("clipboard: reference --clip-file non-ASCII (emoji, CJK) → exe prints CLIP", test_clip_exe_receives_non_ascii),
+    ("clipboard: exactly 1,048,576 bytes → exe prints CLIP", test_clip_exe_receives_1mib),
+    ("clipboard: 1,048,577 bytes → exe discards (no CLIP)", test_clip_exe_discards_over_limit),
+    ("clipboard: invalid UTF-8 → exe discards (no CLIP)", test_clip_exe_discards_invalid_utf8),
+    ("clipboard: chunk without `first` → exe discards", test_clip_exe_discards_chunk_without_first),
+    ("clipboard: stray chunk with another transfer_id → exe ignores it", test_clip_exe_ignores_stray_transfer_id),
+    ("clipboard: corrupted chunk → exe drops the connection", test_clip_exe_drops_corrupt_chunk),
+    ("clipboard: exe --clip-file small, non-ASCII → reference prints CLIP", test_clip_exe_sends_small_and_non_ascii),
+    ("clipboard: exe --clip-file 40 KB, split emoji → reference prints CLIP", test_clip_exe_sends_multi_chunk),
+    ("clipboard: exe --clip-file exactly 1,048,576 bytes → reference prints CLIP", test_clip_exe_sends_1mib),
+    ("clipboard: exe does not send a 1,048,577-byte text", test_clip_exe_does_not_send_over_limit),
+    ("clipboard: exe sends nothing to a Mac with CAPS 0 or no CAPS", test_clip_exe_respects_peer_caps),
     ("pairing positive: same SAS and ltk, then a session with that ltk", test_pair_positive),
     ("pairing positive with long UTF-8 names", test_pair_long_names),
     ("pairing bad commit: exe PAIR FAILED (no SAS), exit 2", test_pair_bad_commit),

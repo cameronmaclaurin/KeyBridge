@@ -31,6 +31,36 @@ final class KBP2Server {
     var onHandshakeFailed: ((KBP2HandshakeError) -> Void)?
     var onPong: (() -> Void)?
 
+    // §5a clipboard. Never logged.
+    /// The user's "Share clipboard" setting. Sets the CAPS bit sent to new sessions; while
+    /// off, nothing is sent and received DATA is ignored.
+    var clipboardEnabled = false {
+        didSet {
+            guard clipboardEnabled != oldValue else { return }
+            if !clipboardEnabled, let s = session {
+                let t = s.outgoing
+                s.outgoing = nil
+                s.reassembler.reset()
+                t?.finish(false)
+            }
+            updateClipboardAvailability()
+        }
+    }
+    /// True while a session is authenticated, its peer's CAPS had bit0 set and sharing is on.
+    var canSendClipboard: Bool {
+        guard clipboardEnabled, let s = session else { return false }
+        return s.peerCaps & KBP2.capClipboardText != 0
+    }
+    /// `canSendClipboard` changed (peer CAPS arrived, session ended or replaced, setting toggled).
+    var onClipboardAvailabilityChanged: ((Bool) -> Void)?
+    /// The peer's CAPS record arrived (its `b1`).
+    var onPeerCaps: ((UInt8) -> Void)?
+    /// A complete clipboard transfer arrived: valid UTF-8 bytes, at most 1 MiB.
+    var onClipboardText: ((Data) -> Void)?
+    /// A clipboard transfer from the peer has started but not finished.
+    var isReceivingClipboard: Bool { session?.reassembler.inProgress ?? false }
+    private var clipboardAvailable = false
+
     enum PairingEvent {
         /// A PC sent a valid PairHello; PairCommit is on its way.
         case started(pcName: String)
@@ -184,6 +214,88 @@ final class KBP2Server {
         guard let s = session else { return }
         guard let rec = s.channel.seal(type, b1, b2, b3) else { end(s); return }
         s.conn.send(content: rec, completion: .idempotent)
+    }
+
+    // MARK: Clipboard (§5a)
+
+    private final class OutgoingTransfer {
+        var chunks: [Data]
+        var next = 0
+        private var completion: ((Bool) -> Void)?
+        init(chunks: [Data], completion: ((Bool) -> Void)?) {
+            self.chunks = chunks
+            self.completion = completion
+        }
+        /// Reports the outcome once; later calls do nothing.
+        func finish(_ sent: Bool) {
+            let c = completion
+            completion = nil
+            chunks = []
+            c?(sent)
+        }
+    }
+
+    /// Sends UTF-8 clipboard text as one transfer, if the peer accepts it. Starting a new
+    /// transfer abandons one still in flight. Chunks go out one at a time, each after the
+    /// previous one has been handed to the network, so KEY records interleave between them
+    /// instead of queueing behind up to 1 MiB. `completion(true)` once the last chunk is
+    /// handed off; `false` if not sent, abandoned or the session ended.
+    func sendClipboardText(_ utf8: Data, completion: ((Bool) -> Void)? = nil) {
+        guard canSendClipboard, let s = session,
+              !utf8.isEmpty, utf8.count <= KBP2.maxTransferBytes
+        else { completion?(false); return }
+        let id = s.nextTransferID
+        s.nextTransferID &+= 1
+        let t = OutgoingTransfer(
+            chunks: KBP2Transfer.chunks(kind: KBP2.DataKind.clipboardText.rawValue, transferID: id, payload: utf8),
+            completion: completion)
+        let old = s.outgoing
+        s.outgoing = t
+        old?.finish(false)
+        sendNextChunk(s, t)
+    }
+
+    private func sendNextChunk(_ s: Session, _ t: OutgoingTransfer) {
+        guard session === s, s.outgoing === t, canSendClipboard else {
+            if s.outgoing === t { s.outgoing = nil }
+            t.finish(false)
+            return
+        }
+        guard t.next < t.chunks.count else {
+            s.outgoing = nil
+            t.finish(true)
+            return
+        }
+        let chunk = t.chunks[t.next]
+        t.chunks[t.next] = Data()  // don't keep plaintext around longer than needed
+        t.next += 1
+        guard let wire = s.channel.sealData(chunk: chunk) else { end(s); return }
+        s.conn.send(content: wire, completion: .contentProcessed { [weak self, weak s, weak t] error in
+            // Runs on the main queue, on a later turn than this send.
+            guard let self, let s, let t else { return }
+            if error != nil {
+                if s.outgoing === t { s.outgoing = nil }
+                t.finish(false)
+                return
+            }
+            self.sendNextChunk(s, t)
+        })
+    }
+
+    private func updateClipboardAvailability() {
+        let now = canSendClipboard
+        guard now != clipboardAvailable else { return }
+        clipboardAvailable = now
+        onClipboardAvailabilityChanged?(now)
+    }
+
+    /// A decrypted chunk plaintext from the peer.
+    private func handleChunk(_ s: Session, _ chunk: Data) {
+        guard clipboardEnabled else { return }  // sharing off: ignore DATA
+        guard let (kind, payload) = s.reassembler.add(chunk) else { return }
+        // Unknown kinds are discarded; text must be valid UTF-8.
+        guard kind == KBP2.DataKind.clipboardText.rawValue, KBP2Transfer.isValidUTF8(payload) else { return }
+        onClipboardText?(payload)
     }
 
     // MARK: Handshake (§4)
@@ -493,6 +605,11 @@ final class KBP2Server {
         var channel: KBP2RecordChannel
         var pingTimer: DispatchSourceTimer?
         var livenessTimer: DispatchSourceTimer?
+        /// §5a: the peer's CAPS `b1` (0 until its CAPS arrives).
+        var peerCaps: UInt8 = 0
+        var nextTransferID: UInt16 = 0
+        var outgoing: OutgoingTransfer?
+        var reassembler = KBP2Reassembler()
 
         init(conn: NWConnection, host: String, channel: KBP2RecordChannel) {
             self.conn = conn
@@ -510,9 +627,13 @@ final class KBP2Server {
         if let old = session {
             session = nil
             stopTimers(old)
+            abandonClipboard(old)
             Self.closeGracefully(old.conn, completion: nil)
         }
         session = s
+        // §5a: CAPS is the first record we send on every session.
+        send(KBP2.RecordType.caps.rawValue, clipboardEnabled ? KBP2.capClipboardText : 0)
+        updateClipboardAvailability()  // a replaced session may have been sharing
 
         s.conn.stateUpdateHandler = { [weak self, weak s] state in
             guard let self, let s else { return }
@@ -551,6 +672,7 @@ final class KBP2Server {
         s.conn.receive(minimumIncompleteLength: KBP2.recordLength,
                        maximumLength: KBP2.recordLength) { [weak self, weak s] data, _, isComplete, error in
             guard let self, let s, self.session === s else { return }
+            var chunkLength: Int?
             if let data, !data.isEmpty {
                 // Any authentication failure (or a short record) closes the connection.
                 guard data.count == KBP2.recordLength, let pt = s.channel.open(data) else {
@@ -558,20 +680,64 @@ final class KBP2Server {
                     return
                 }
                 s.livenessTimer?.schedule(deadline: .now() + KBP2.livenessTimeout)
-                if pt[0] == KBP2.RecordType.pong.rawValue {
+                switch pt[0] {
+                case KBP2.RecordType.pong.rawValue:
                     if let sent = self.pingSentAt {
                         let rtt = Double(DispatchTime.now().uptimeNanoseconds - sent.uptimeNanoseconds) / 1e9
                         self.roundTrip = self.roundTrip.map { $0 * 0.7 + rtt * 0.3 } ?? rtt
                         self.pingSentAt = nil
                     }
                     self.onPong?()
+                case KBP2.RecordType.caps.rawValue:
+                    s.peerCaps = pt[1]
+                    self.onPeerCaps?(pt[1])
+                    self.updateClipboardAvailability()
+                case KBP2.RecordType.data.rawValue:
+                    let n = Int(pt[1]) << 16 | Int(pt[2]) << 8 | Int(pt[3])
+                    // A chunk of the wrong length is a bad chunk: close.
+                    guard n >= KBP2.minChunkPlaintext, n <= KBP2.maxChunkPlaintext else {
+                        self.end(s)
+                        return
+                    }
+                    chunkLength = n
+                default:
+                    break  // unknown types are ignored (forward compatibility)
                 }
-                // Unknown types are ignored (forward compatibility).
             }
+            guard self.session === s else { return }
+            if isComplete || error != nil { self.end(s); return }
+            if let n = chunkLength {
+                self.receiveChunk(s, length: n)
+            } else {
+                self.receiveRecord(s)
+            }
+        }
+    }
+
+    /// §5a: the sealed chunk immediately following a DATA header.
+    private func receiveChunk(_ s: Session, length n: Int) {
+        let wireLength = n + KBP2.tagLength
+        s.conn.receive(minimumIncompleteLength: wireLength,
+                       maximumLength: wireLength) { [weak self, weak s] data, _, isComplete, error in
+            guard let self, let s, self.session === s else { return }
+            guard let data, let chunk = s.channel.openChunk(data, length: n) else {
+                self.end(s)  // short, or failed authentication
+                return
+            }
+            s.livenessTimer?.schedule(deadline: .now() + KBP2.livenessTimeout)
+            self.handleChunk(s, chunk)
             guard self.session === s else { return }
             if isComplete || error != nil { self.end(s); return }
             self.receiveRecord(s)
         }
+    }
+
+    private func abandonClipboard(_ s: Session) {
+        let t = s.outgoing
+        s.outgoing = nil
+        s.reassembler.reset()
+        t?.finish(false)
+        updateClipboardAvailability()
     }
 
     private func stopTimers(_ s: Session) {
@@ -589,6 +755,7 @@ final class KBP2Server {
         roundTrip = nil
         pingSentAt = nil
         stopTimers(s)
+        abandonClipboard(s)
         if graceful {
             Self.closeGracefully(s.conn, completion: completion)
         } else {

@@ -71,7 +71,7 @@ set "LIBS=ws2_32.lib user32.lib shell32.lib gdi32.lib bcrypt.lib crypt32.lib com
 rem Protocol, pairing, discovery and update-verification code shared by both
 rem builds (Appendix A and UPDATES.md section 6: the selftest must run the same
 rem code as the app).
-set "CORE=src\kbp2.c src\pairing.c src\discovery.c src\crypto.c src\kbutil.c src\update.c src\update_manifest.c"
+set "CORE=src\kbp2.c src\kbclip.c src\pairing.c src\discovery.c src\crypto.c src\kbutil.c src\update.c src\update_manifest.c"
 
 if /i "%MODE%"=="selftest" goto :selftest
 
@@ -88,7 +88,7 @@ rc /nologo /I src /I %OBJ% /fo %OBJ%\keybridge.res keybridge.rc || goto :fail
 
 if exist "%OUT%\KeyBridge.exe" del /q "%OUT%\KeyBridge.exe" || goto :fail
 cl %CFLAGS% /I %OBJ% /Fo%OBJ%\ /Fe%OUT%\KeyBridge.exe ^
-    src\main.c src\worker.c src\inject.c src\config.c %CORE% %OBJ%\keybridge.res ^
+    src\main.c src\worker.c src\clipboard.c src\inject.c src\config.c %CORE% %OBJ%\keybridge.res ^
     /link %LFLAGS% /SUBSYSTEM:WINDOWS /MANIFEST:NO %LIBS% || goto :fail
 if not exist "%OUT%\KeyBridge.exe" goto :fail
 

@@ -7,9 +7,11 @@
  * (pairing.c) and discovery code (discovery.c) as the app, but never
  * injects keys. Shipping builds never compile this file.
  *
- *   --selftest-client      --host H --port P --psk <64 hex>             (A.2)
+ *   --selftest-client      --host H --port P --psk <64 hex> [--clip-file F] (A.2)
  *       0 server closed after a good session, 1 failure after HANDSHAKE OK
- *       (or could not connect), 2 handshake failed.
+ *       (or could not connect), 2 handshake failed. --clip-file: 1..1048576
+ *       bytes sent as one clipboard transfer after the server's CAPS
+ *       (an empty or larger file is not sent; the session runs as usual).
  *   --selftest-pair-client --host H --port P --name NAME [--confirm yes|no] (A.4)
  *       0 PAIRED or CANCELLED, 2 PAIR FAILED.
  *   --selftest-discover    [--timeout <seconds, default 5>]             (A.5)
@@ -33,6 +35,7 @@
 #include "kbutil.h"
 #include "crypto.h"
 #include "kbp2.h"
+#include "kbclip.h"
 #include "pairing.h"
 #include "discovery.h"
 #include "update.h"
@@ -59,7 +62,8 @@ static void out_line(const char *line)
 
 static int usage(void)
 {
-    fputs("usage: KeyBridge-selftest.exe --selftest-client --host <H> --port <P> --psk <64 hex chars>\n"
+    fputs("usage: KeyBridge-selftest.exe --selftest-client --host <H> --port <P> --psk <64 hex chars>"
+          " [--clip-file <path>]\n"
           "       KeyBridge-selftest.exe --selftest-pair-client --host <H> --port <P> --name <NAME>"
           " [--confirm yes|no]\n"
           "       KeyBridge-selftest.exe --selftest-discover [--timeout <seconds>]\n"
@@ -150,50 +154,144 @@ static void net_cleanup(void)
 /* A.2 session client                                                       */
 /* ------------------------------------------------------------------------ */
 
-/* After HANDSHAKE OK: print every event until the server closes. */
+/* The optional --clip-file contents (at most 1 MiB, section 5a). */
+static uint8_t g_clip_file[KBCLIP_TEXT_MAX];
+static size_t  g_clip_file_len;
+static BOOL    g_clip_file_set;
+
+/* The record pump and a chunk buffer (too big for the stack). */
+static kbp2_io g_io;
+static uint8_t g_chunk[KBCLIP_CHUNK_MAX];
+
+/* "CLIP <byte length> <sha256 hex lowercase>" */
+static void print_clip(const uint8_t *text, size_t len)
+{
+    static const char hex[] = "0123456789abcdef";
+    uint8_t sha[KB_SHA256_LEN];
+    char line[32 + 2 * KB_SHA256_LEN];
+    int n, i;
+
+    if (!kb_sha256(text, (ULONG)len, NULL, 0, sha)) {
+        fputs("error: SHA-256 failed\n", stderr);
+        return;
+    }
+    n = snprintf(line, sizeof(line), "CLIP %lu ", (unsigned long)len);
+    if (n < 0 || (size_t)n + 2 * KB_SHA256_LEN >= sizeof(line))
+        return;
+    for (i = 0; i < KB_SHA256_LEN; i++) {
+        line[n + 2 * i] = hex[sha[i] >> 4];
+        line[n + 2 * i + 1] = hex[sha[i] & 0x0F];
+    }
+    line[n + 2 * KB_SHA256_LEN] = 0;
+    out_line(line);
+}
+
+/* After HANDSHAKE OK: send our CAPS, then print every event until the server
+ * closes. Uses the same kbp2_io pump and kbclip reassembly as the app. */
 static int run_session(kbp2_conn *c, kbp2_session *s)
 {
     static const uint8_t pong[KBP2_PLAINTEXT_LEN] = { KBP2_PONG, 0, 0, 0 };
-    uint8_t pt[KBP2_PLAINTEXT_LEN];
+    static const uint8_t caps[KBP2_PLAINTEXT_LEN] = { KBP2_CAPS, KBP2_CAPS_CLIPBOARD, 0, 0 };
+    kbclip_rx rx;
     char line[64];
+    BOOL caps_seen = FALSE, sending = FALSE;
+    size_t clip_off = 0;
+    int rc = EXIT_ERROR;
+    kbp2_status st;
+
+    kbp2_io_init(&g_io, c, s);
+    kbclip_rx_init(&rx);
+
+    /* Section 5a: our CAPS is the first record after ClientFinished. */
+    st = kbp2_io_queue_record(&g_io, caps);
+    if (st != KBP2_OK) {
+        fprintf(stderr, "error: could not send CAPS: %s\n", kbp2_status_text(st));
+        goto done;
+    }
 
     for (;;) {
-        kbp2_status st = kbp2_recv_record(c, s, pt, KBP2_LIVENESS_MS);
+        kbp2_event ev;
+
+        if (sending && kbp2_io_send_idle(&g_io)) {
+            size_t n = kbclip_make_chunk(g_chunk, 0, g_clip_file, g_clip_file_len, &clip_off);
+            if (n != 0) {
+                st = kbp2_io_queue_chunk(&g_io, g_chunk, n);
+                if (st != KBP2_OK) {
+                    fprintf(stderr, "error: could not send clipboard data: %s\n",
+                            kbp2_status_text(st));
+                    goto done;
+                }
+            }
+            if (n == 0 || clip_off >= g_clip_file_len)
+                sending = FALSE;
+        }
+
+        st = kbp2_io_next(&g_io, NULL, sending, &ev);
         if (st == KBP2_ERR_CLOSED) {
             out_line("CLOSED");
-            return EXIT_OK;
+            rc = EXIT_OK;
+            goto done;
         }
         if (st != KBP2_OK) {
             fprintf(stderr, "error: %s\n", kbp2_status_text(st));
-            return EXIT_ERROR;
+            goto done;
         }
 
-        switch (pt[0]) {
+        if (ev.type == KBP2_EV_CHUNK) {
+            uint8_t *text;
+            size_t len;
+            if (kbclip_rx_chunk(&rx, ev.data, ev.len, &text, &len)) {
+                print_clip(text, len);
+                kbclip_free(text, len);
+            }
+            continue;
+        }
+        if (ev.type != KBP2_EV_RECORD)
+            continue; /* KBP2_EV_SENT: queue the next chunk */
+
+        switch (ev.data[0]) {
         case KBP2_KEY: {
-            unsigned vk = (unsigned)pt[2] | ((unsigned)pt[3] << 8);
+            unsigned vk = (unsigned)ev.data[2] | ((unsigned)ev.data[3] << 8);
             if (vk >= 1 && vk <= 254) { /* others are ignored and not printed */
                 (void)snprintf(line, sizeof(line), "KEY down=%u ext=%u vk=0x%04X",
-                               (unsigned)(pt[1] & KBP2_FLAG_DOWN),
-                               (unsigned)((pt[1] & KBP2_FLAG_EXTENDED) >> 1), vk);
+                               (unsigned)(ev.data[1] & KBP2_FLAG_DOWN),
+                               (unsigned)((ev.data[1] & KBP2_FLAG_EXTENDED) >> 1), vk);
                 out_line(line);
             }
             break;
         }
         case KBP2_PING:
             out_line("PING");
-            st = kbp2_send_record(c, s, pong);
+            st = kbp2_io_queue_record(&g_io, pong);
             if (st != KBP2_OK) {
                 fprintf(stderr, "error: could not send PONG: %s\n", kbp2_status_text(st));
-                return EXIT_ERROR;
+                goto done;
             }
             break;
         case KBP2_RELEASE_ALL:
             out_line("RELEASE_ALL");
             break;
+        case KBP2_CAPS:
+            (void)snprintf(line, sizeof(line), "CAPS %u", (unsigned)ev.data[1]);
+            out_line(line);
+            /* --clip-file: one transfer (transfer_id 0) once the server says
+             * it can receive clipboard text. */
+            if (!caps_seen && g_clip_file_set && (ev.data[1] & KBP2_CAPS_CLIPBOARD) != 0) {
+                sending = TRUE;
+                clip_off = 0;
+            }
+            caps_seen = TRUE;
+            break;
         default:
             break; /* unknown types are ignored */
         }
     }
+
+done:
+    kbclip_rx_free(&rx);
+    kbp2_io_wipe(&g_io);
+    SecureZeroMemory(g_chunk, sizeof(g_chunk));
+    return rc;
 }
 
 static int run_client(const wchar_t *host, const wchar_t *port, uint8_t psk[KBP2_PSK_LEN])
@@ -529,7 +627,7 @@ enum { MODE_NONE, MODE_CLIENT, MODE_PAIR_CLIENT, MODE_DISCOVER, MODE_VERIFY_UPDA
 int wmain(int argc, wchar_t **argv)
 {
     const wchar_t *host = NULL, *port = NULL, *psk_arg = NULL, *name = NULL;
-    const wchar_t *confirm = NULL, *timeout = NULL;
+    const wchar_t *confirm = NULL, *timeout = NULL, *clip_file = NULL;
     const wchar_t *current = NULL, *pubkey_arg = NULL, *manifest_path = NULL, *sig_path = NULL;
     char current8[KB_UPD_VERSION_MAX + 1], pubkey8[2 * KB_UPD_PUBKEY_LEN + 1];
     uint8_t pubkey[KB_UPD_PUBKEY_LEN];
@@ -568,6 +666,8 @@ int wmain(int argc, wchar_t **argv)
             slot = &confirm;
         else if (wcscmp(a, L"--timeout") == 0)
             slot = &timeout;
+        else if (wcscmp(a, L"--clip-file") == 0)
+            slot = &clip_file;
         else
             return usage();
 
@@ -589,6 +689,8 @@ int wmain(int argc, wchar_t **argv)
     }
 
     if (mode != MODE_VERIFY_UPDATE && (current != NULL || pubkey_arg != NULL))
+        return usage();
+    if (mode != MODE_CLIENT && clip_file != NULL)
         return usage();
 
     switch (mode) {
@@ -615,6 +717,24 @@ int wmain(int argc, wchar_t **argv)
         if (host == NULL || port == NULL || psk_arg == NULL || name != NULL || confirm != NULL ||
             timeout != NULL || !valid_port(port))
             return usage();
+        if (clip_file != NULL) {
+            int frc = read_small_file(clip_file, g_clip_file, (DWORD)sizeof(g_clip_file),
+                                      &g_clip_file_len);
+            if (frc < 0) {
+                fputs("error: could not read --clip-file\n", stderr);
+                return EXIT_USAGE;
+            }
+            /* Section 5a: text over 1,048,576 bytes is not sent at all, and a
+             * transfer carries at least one byte (N >= 5). The session still
+             * runs normally. */
+            g_clip_file_set = frc == 1 && g_clip_file_len != 0;
+            if (!g_clip_file_set) {
+                SecureZeroMemory(g_clip_file, sizeof(g_clip_file));
+                g_clip_file_len = 0;
+                fputs("note: --clip-file is empty or over 1048576 bytes; it will not be sent\n",
+                      stderr);
+            }
+        }
         if (!parse_psk(psk_arg, psk)) {
             fputs("error: --psk must be 64 hex characters\n", stderr);
             return EXIT_USAGE;

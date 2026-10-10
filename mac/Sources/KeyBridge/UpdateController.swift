@@ -99,7 +99,7 @@ final class UpdateController: NSObject {
         let manual = manualCheck
         state = .idle
         NSLog("[KeyBridge] Update check failed: \(why)")
-        if manual { showAlert("Couldn’t check for updates: \(why)", "") }
+        if manual { showAlert("Couldn’t check for updates", Self.sentence(why)) }
     }
 
     private func checked(manifest: Data, signature: Data) {
@@ -132,8 +132,9 @@ final class UpdateController: NSObject {
         state = .prompting
         activate()
         let alert = NSAlert()
-        alert.messageText = "KeyBridge \(m.version) is available — you have \(running)."
-        var info = "KeyBridge quits while the update installs and opens again afterwards."
+        alert.icon = NSApp.applicationIconImage
+        alert.messageText = "KeyBridge \(m.version) is available"
+        var info = "You have version \(running). KeyBridge quits while the update installs and opens again afterwards."
         if !Self.runningFromApplications {
             info += " The update installs KeyBridge into your Applications folder."
         }
@@ -258,9 +259,17 @@ final class UpdateController: NSObject {
     private func showAlert(_ title: String, _ text: String) {
         activate()
         let alert = NSAlert()
+        alert.icon = NSApp.applicationIconImage
         alert.messageText = title
         alert.informativeText = text
         alert.runModal()
+    }
+
+    /// "the server responded…" → "The server responded…".
+    private static func sentence(_ s: String) -> String {
+        guard let first = s.first else { return s }
+        let out = first.uppercased() + s.dropFirst()
+        return out.hasSuffix(".") ? out : out + "."
     }
 
     private func activate() {
@@ -297,7 +306,8 @@ private final class ReleaseNotesLink: NSButton {
     }
 }
 
-/// Small window: "Downloading update…" with a determinate bar and Cancel, then "Installing…".
+/// Small window: the app icon beside "Downloading update…", a determinate bar and Cancel,
+/// then "Installing…".
 @MainActor
 final class UpdateProgressWindow: NSWindowController {
     var onCancel: (() -> Void)?
@@ -310,15 +320,22 @@ final class UpdateProgressWindow: NSWindowController {
 
     init(total: Int64) {
         self.total = total
-        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 380, height: 120),
-                            styleMask: [.titled], backing: .buffered, defer: false)
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 420, height: 120),
+                            styleMask: [.titled, .fullSizeContentView], backing: .buffered, defer: false)
         panel.title = "KeyBridge Update"
+        panel.titleVisibility = .hidden
+        panel.titlebarAppearsTransparent = true
+        panel.isMovableByWindowBackground = true
         panel.isReleasedWhenClosed = false
         panel.hidesOnDeactivate = false
         super.init(window: panel)
 
-        title.font = .systemFont(ofSize: 13, weight: .semibold)
-        detail.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        let icon = NSImageView()
+        icon.image = NSApp.applicationIconImage
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        icon.setAccessibilityElement(false)
+        title.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
+        detail.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
         detail.textColor = .secondaryLabelColor
         bar.isIndeterminate = false
         bar.minValue = 0
@@ -329,24 +346,30 @@ final class UpdateProgressWindow: NSWindowController {
         cancelButton.target = self
         cancelButton.action = #selector(cancelTapped)
 
-        let buttonRow = NSStackView()
-        buttonRow.addView(cancelButton, in: .trailing)
-        let stack = NSStackView(views: [title, bar, detail, buttonRow])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 8
-        stack.setCustomSpacing(12, after: detail)
-        stack.translatesAutoresizingMaskIntoConstraints = false
+        let column = NSStackView(views: [title, bar, detail])
+        column.orientation = .vertical
+        column.alignment = .leading
+        column.spacing = 8
         let content = NSView()
-        content.addSubview(stack)
+        for v in [icon, column, cancelButton] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(v)
+        }
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
-            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
-            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
-            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
-            bar.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            bar.widthAnchor.constraint(equalToConstant: 340),
-            buttonRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 64),
+            icon.heightAnchor.constraint(equalToConstant: 64),
+            icon.topAnchor.constraint(equalTo: content.topAnchor, constant: 32),
+            icon.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
+            column.topAnchor.constraint(equalTo: icon.topAnchor, constant: 6),
+            column.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 16),
+            column.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            bar.widthAnchor.constraint(equalTo: column.widthAnchor),
+            bar.widthAnchor.constraint(equalToConstant: 300),
+            cancelButton.topAnchor.constraint(greaterThanOrEqualTo: column.bottomAnchor, constant: 16),
+            cancelButton.topAnchor.constraint(greaterThanOrEqualTo: icon.bottomAnchor, constant: 8),
+            cancelButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            cancelButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
+            cancelButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 90),
         ])
         panel.contentView = content
         panel.setContentSize(content.fittingSize)
