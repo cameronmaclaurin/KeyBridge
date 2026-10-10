@@ -1,9 +1,6 @@
 import CoreGraphics
 
 // Maps Mac CGKeyCode → Windows Virtual Key code.
-// Switch hotkey: Ctrl + Shift + ` (either side's Ctrl/Shift).
-let kCtrlKeys: Set<CGKeyCode> = [0x3B, 0x3E]
-let kShiftKeys: Set<CGKeyCode> = [0x38, 0x3C]
 let kBacktick: CGKeyCode = 0x32
 let kCapsLock: CGKeyCode = 0x39
 

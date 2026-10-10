@@ -26,6 +26,12 @@ final class KeyCapture {
 
     /// true = swallow keys locally and forward them; false = let them reach the Mac.
     var suppress = false
+    var hotkey = Hotkey.default
+    /// ⌘ → Ctrl and ⌃ → Windows key on the PC.
+    var swapCommandControl = false
+    /// While set, the next non-modifier key press (with its modifiers) is swallowed and
+    /// reported here instead of being typed; Escape alone reports nil (cancel).
+    var onRecordHotkey: ((Hotkey?) -> Void)?
 
     private var tap: CFMachPort?
     private var pressedKeys = Set<CGKeyCode>()
@@ -68,7 +74,14 @@ final class KeyCapture {
         switch type {
         case .keyDown:
             pressedKeys.insert(keyCode)
-            if keyCode == kBacktick && isHotkeyHeld() {
+            if let record = onRecordHotkey, !suppress {
+                let mods = heldMods()
+                onRecordHotkey = nil
+                let result: Hotkey? = (keyCode == 0x35 && mods.isEmpty) ? nil : Hotkey(keyCode: keyCode, mods: mods)
+                DispatchQueue.main.async { record(result) }
+                return nil
+            }
+            if keyCode == hotkey.keyCode && heldMods() == hotkey.mods {
                 DispatchQueue.main.async { self.onHotkeyToggle?() }
                 return nil
             }
@@ -100,12 +113,29 @@ final class KeyCapture {
         for kc in pressedKeys { dispatch(false, kc) }
     }
 
-    private func isHotkeyHeld() -> Bool {
-        !pressedKeys.isDisjoint(with: kCtrlKeys) && !pressedKeys.isDisjoint(with: kShiftKeys)
+    private func heldMods() -> HotkeyMods {
+        var m: HotkeyMods = []
+        for (mod, codes) in HotkeyMods.keyCodes where !pressedKeys.isDisjoint(with: codes) {
+            m.insert(mod)
+        }
+        return m
+    }
+
+    private func vk(for keyCode: CGKeyCode) -> UInt16? {
+        if swapCommandControl {
+            switch keyCode {
+            case 0x37: return 0xA2  // L-Cmd  → LCtrl
+            case 0x36: return 0xA3  // R-Cmd  → RCtrl
+            case 0x3B: return 0x5B  // L-Ctrl → LWin
+            case 0x3E: return 0x5C  // R-Ctrl → RWin
+            default: break
+            }
+        }
+        return cgToVk[keyCode]
     }
 
     private func dispatch(_ isDown: Bool, _ keyCode: CGKeyCode) {
-        guard let vk = cgToVk[keyCode] else { return }
+        guard let vk = vk(for: keyCode) else { return }
         onKeyEvent?(KeyEvent(isDown: isDown, vk: vk, isExtended: keyCode == kKeypadEnter))
     }
 }

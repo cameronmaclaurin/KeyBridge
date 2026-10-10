@@ -270,6 +270,20 @@ jobs:
         shell: pwsh
         run: python tests\check_no_selftest.py windows\build\KeyBridge.exe
 
+      - name: Measure KeyBridge.exe memory (idle, setup window open)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath windows\build\KeyBridge.exe -PassThru
+          Start-Sleep -Seconds 6
+          $p.Refresh()
+          if ($p.HasExited) {
+            Write-Host "::warning::KeyBridge.exe exited before it could be measured (exit code $($p.ExitCode))"
+          } else {
+            $line = "Working set {0:N1} MB, private {1:N1} MB" -f ($p.WorkingSet64 / 1MB), ($p.PrivateMemorySize64 / 1MB)
+            Write-Host "::notice title=KeyBridge.exe memory::$line"
+            Stop-Process -Id $p.Id -Force
+          }
+
       - name: Set up code signing
         if: env.HAVE_WIN_CERT == 'true'
         shell: pwsh

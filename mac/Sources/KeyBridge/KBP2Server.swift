@@ -46,6 +46,9 @@ final class KBP2Server {
     var onPairingConnectionClosed: (() -> Void)?
 
     var isAuthenticated: Bool { session != nil }
+    /// Smoothed PING→PONG round trip of the current session, in seconds.
+    private(set) var roundTrip: TimeInterval?
+    private var pingSentAt: DispatchTime?
     var peerHost: String? { session?.host }
     var isPairing: Bool { pairing != nil }
 
@@ -170,7 +173,10 @@ final class KBP2Server {
         send(KBP2.RecordType.key.rawValue, f.0, f.1, f.2)
     }
 
-    func sendPing() { send(KBP2.RecordType.ping.rawValue) }
+    func sendPing() {
+        pingSentAt = .now()
+        send(KBP2.RecordType.ping.rawValue)
+    }
 
     func sendReleaseAll() { send(KBP2.RecordType.releaseAll.rawValue) }
 
@@ -552,7 +558,14 @@ final class KBP2Server {
                     return
                 }
                 s.livenessTimer?.schedule(deadline: .now() + KBP2.livenessTimeout)
-                if pt[0] == KBP2.RecordType.pong.rawValue { self.onPong?() }
+                if pt[0] == KBP2.RecordType.pong.rawValue {
+                    if let sent = self.pingSentAt {
+                        let rtt = Double(DispatchTime.now().uptimeNanoseconds - sent.uptimeNanoseconds) / 1e9
+                        self.roundTrip = self.roundTrip.map { $0 * 0.7 + rtt * 0.3 } ?? rtt
+                        self.pingSentAt = nil
+                    }
+                    self.onPong?()
+                }
                 // Unknown types are ignored (forward compatibility).
             }
             guard self.session === s else { return }
@@ -573,6 +586,8 @@ final class KBP2Server {
     private func end(_ s: Session, graceful: Bool = false, completion: (() -> Void)? = nil) {
         guard session === s else { completion?(); return }
         session = nil
+        roundTrip = nil
+        pingSentAt = nil
         stopTimers(s)
         if graceful {
             Self.closeGracefully(s.conn, completion: completion)

@@ -89,7 +89,7 @@ The Mac's Pairing window accepts a PC for 3 minutes. If that runs out, click **S
 
 ## Using it
 
-**Switching:** press <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>&#96;</kbd> on the Mac (that's Control, Shift and the backtick key, left of <kbd>1</kbd> on US keyboards). You can also choose **Switch to Windows Mode** or **Switch to Local Mode** from the KeyBridge menu. Keys you're holding down are released when you switch or when the connection drops, so nothing gets stuck.
+**Switching:** press <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>&#96;</kbd> on the Mac (that's Control, Shift and the backtick key, left of <kbd>1</kbd> on US keyboards). You can also choose **Switch to Windows Mode** or **Switch to Local Mode** from the KeyBridge menu. Keys you're holding down are released when you switch or when the connection drops, so nothing gets stuck. To use a different shortcut, open **Settings…** (<kbd>⌘</kbd> + <kbd>,</kbd> with the KeyBridge menu open) and click **Record Shortcut**.
 
 **What the icons mean**
 
@@ -101,7 +101,9 @@ The Mac's Pairing window accepts a PC for 3 minutes. If that runs out, click **S
 | Windows tray | Color | Connected to your Mac. |
 | Windows tray | Gray | Not connected. KeyBridge keeps trying to reconnect. |
 
-The KeyBridge menu on the Mac also shows the current mode and connection status.
+The KeyBridge menu on the Mac also shows the current mode, the connection status and the live round-trip latency to the PC (for example `PC connected: 192.168.1.20 · 3 ms`).
+
+**Settings** (KeyBridge menu → **Settings…**): change the switch shortcut, swap <kbd>⌘</kbd> and <kbd>⌃</kbd> on Windows, play a sound when switching, turn notifications off, launch at login, and see or forget the paired PC.
 
 **Key mapping**
 
@@ -112,6 +114,8 @@ The KeyBridge menu on the Mac also shows the current mode and connection status.
 | <kbd>Control ⌃</kbd> | <kbd>Ctrl</kbd> |
 
 For example, <kbd>⌘</kbd> opens the Start menu, and Windows shortcuts like <kbd>Ctrl</kbd> + <kbd>C</kbd> use the Mac's Control key.
+
+Prefer Mac-style shortcuts? Turn on **Use ⌘ Command as Ctrl on Windows** in Settings. Then <kbd>⌘</kbd> + <kbd>C</kbd> / <kbd>⌘</kbd> + <kbd>V</kbd> copy and paste on the PC, and <kbd>⌃</kbd> Control becomes the Windows key.
 
 ## Security
 

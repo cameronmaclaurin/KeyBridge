@@ -6,7 +6,7 @@ import ServiceManagement
 import UserNotifications
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, SettingsWindowDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let capture = KeyCapture()
     private var server: KBP2Server?
@@ -23,6 +23,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var pairingWindow: PairingWindowController?
     private var pairingExpiryTimer: Timer?
     private var nameWatcher: SystemNameWatcher?
+    private var settingsWindow: SettingsWindowController?
+    private let settings = AppSettings.shared
 
     private var modeLine: NSMenuItem!
     private var connLine: NSMenuItem!
@@ -36,6 +38,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ n: Notification) {
         installEditMenu()
         buildMenu()
+        applySettings()
+        settings.onChange = { [weak self] in self?.applySettings() }
         if warnIfRunningFromDiskImage() { return }
 
         if Bundle.main.bundleIdentifier != nil {
@@ -59,6 +63,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         startCapture()
         updateUI()
         if psk == nil { showPairingWindow() }
+        // `open KeyBridge.app --args -KBShowSettings YES` (handy for screenshots and support).
+        if UserDefaults.standard.bool(forKey: "KBShowSettings") { showSettings() }
     }
 
     /// Opening the app again (Finder, Launchpad, `open`) while it runs: a menu-bar app would
@@ -130,14 +136,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // A different PC took over: don't keep typing into it without the user noticing.
             leaveWindowsMode(sendReleaseAll: false)
         }
-        if replaced != host { notify("Windows PC connected", host) }
+        if replaced != host { notify("Windows PC connected", host, optional: true) }
         updateUI()
     }
 
     private func pcDisconnected() {
         if remoteMode {
             leaveWindowsMode(sendReleaseAll: false)
-            notify("Windows PC disconnected", "Your keys are going to this Mac again.")
+            notify("Windows PC disconnected", "Your keys are going to this Mac again.", optional: true)
         }
         updateUI()
     }
@@ -191,6 +197,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func enterWindowsMode() {
         remoteMode = true
+        if settings.playSwitchSound { NSSound(named: "Pop")?.play() }
         capture.suppress = true
         secureInputOn = false
         checkSecureInput()
@@ -206,6 +213,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         capture.suppress = false
         remoteMode = false
+        if settings.playSwitchSound { NSSound(named: "Bottle")?.play() }
         secureInputTimer?.invalidate()
         secureInputTimer = nil
         secureInputOn = false
@@ -347,7 +355,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func connectionStatus() -> String? {
         if let err = listenerError { return "Can’t accept connections on port \(KBP2.port): \(err)" }
-        if let host = server?.peerHost { return "PC connected: \(host)" }
+        if let host = server?.peerHost {
+            if let rtt = server?.roundTrip {
+                return "PC connected: \(host) · \(Self.formatLatency(rtt))"
+            }
+            return "PC connected: \(host)"
+        }
         return pairedPCName == nil ? nil : "PC not connected"
     }
 
@@ -437,8 +450,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
 
         toggleItem = item("", #selector(onToggle))
-        toggleItem.keyEquivalent = "`"
-        toggleItem.keyEquivalentModifierMask = [.control, .shift]
         menu.addItem(toggleItem)
         menu.addItem(.separator())
 
@@ -448,6 +459,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         loginItem = item("Launch at Login", #selector(toggleLaunchAtLogin))
         menu.addItem(loginItem)
         menu.addItem(.separator())
+
+        let settingsItem = item("Settings…", #selector(showSettings))
+        settingsItem.keyEquivalent = ","
+        menu.addItem(settingsItem)
 
         menu.addItem(item("About KeyBridge", #selector(showAbout)))
         let quit = NSMenuItem(title: "Quit KeyBridge", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -503,7 +518,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         accessibilityItem.isHidden = accessibilityGranted
         if !accessibilityGranted { modeLine.title = "Needs Accessibility permission" }
 
-        toggleItem.title = remoteMode ? "Switch to Local Mode" : "Switch to Windows Mode"
+        toggleItem.title = (remoteMode ? "Switch to Local Mode" : "Switch to Windows Mode")
+            + "   " + settings.hotkey.displayString
         updateLoginItem()
     }
 
@@ -550,12 +566,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if #available(macOS 14.0, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
     }
 
-    private func notify(_ title: String, _ body: String) {
+    /// `optional` notifications (connect/disconnect) respect the "Show notifications" setting;
+    /// warnings and answers to something the user just did always show.
+    private func notify(_ title: String, _ body: String, optional: Bool = false) {
         guard Bundle.main.bundleIdentifier != nil else { return }
+        if optional && !settings.showNotifications { return }
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(req)
     }
+
+    // MARK: – Settings
+
+    private func applySettings() {
+        if remoteMode && capture.swapCommandControl != settings.swapCommandControl {
+            // The mapping of held modifiers is about to change: drop everything on the PC first.
+            capture.releaseAllRemote()
+            server?.sendReleaseAll()
+        }
+        capture.hotkey = settings.hotkey
+        capture.swapCommandControl = settings.swapCommandControl
+        updateUI()
+    }
+
+    @objc private func showSettings() {
+        if settingsWindow == nil { settingsWindow = SettingsWindowController(host: self) }
+        settingsWindow?.show()
+    }
+
+    static func formatLatency(_ rtt: TimeInterval) -> String {
+        let ms = rtt * 1000
+        return ms < 1 ? "<1 ms" : String(format: "%.0f ms", ms)
+    }
+
+    func settingsBeginHotkeyRecording(_ done: @escaping (Hotkey?) -> Void) -> Bool {
+        if remoteMode {
+            NSSound.beep()
+            return false
+        }
+        if !accessibilityGranted {
+            notify("KeyBridge needs Accessibility permission",
+                   "Turn on KeyBridge in System Settings → Privacy & Security → Accessibility.")
+            openAccessibilitySettings()
+            return false
+        }
+        capture.onRecordHotkey = done
+        return true
+    }
+
+    func settingsCancelHotkeyRecording() { capture.onRecordHotkey = nil }
+    var settingsPairedName: String? { pairedPCName }
+    var settingsConnectionStatus: String { connectionStatus() ?? "" }
+
+    var settingsLaunchAtLoginState: NSControl.StateValue {
+        switch SMAppService.mainApp.status {
+        case .enabled: return .on
+        case .requiresApproval: return .mixed
+        default: return .off
+        }
+    }
+
+    func settingsToggleLaunchAtLogin() { toggleLaunchAtLogin() }
+    func settingsForgetPC() { forgetPC() }
+    func settingsPairPC() { showPairingWindow() }
 }
