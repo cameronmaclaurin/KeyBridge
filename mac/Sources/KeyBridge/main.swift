@@ -1,11 +1,5 @@
 import AppKit
 
-@MainActor
-func bootstrap() {
-    let app = NSApplication.shared
-    let delegate = AppDelegate()
-    app.delegate = delegate
-    app.run()
-}
-
-bootstrap()
+// Entry point: run entirely on the main actor to satisfy Swift 6 concurrency.
+NSApplication.shared.delegate = AppDelegate()
+NSApplication.shared.run()

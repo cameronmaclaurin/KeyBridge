@@ -19,6 +19,9 @@
 #include <string.h>
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "gdi32.lib")
 
 /* ── Protocol ────────────────────────────────────────────────────────────── */
 /* 4-byte frame sent by Mac:
