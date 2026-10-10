@@ -20,5 +20,9 @@
     <string>NSApplication</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>KeyBridge sends your keystrokes to your Windows PC over the local network.</string>
 </dict>
 </plist>

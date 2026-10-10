@@ -14,16 +14,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build
-        run: |
-          cd mac
-          chmod +x build_app.sh
-          ./build_app.sh
+        run: mac/build_app.sh
 
       - name: Zip .app
-        run: |
-          cd mac
-          zip -r KeyBridge-mac.zip KeyBridge.app
-          mv KeyBridge-mac.zip ../KeyBridge-mac.zip
+        # ditto preserves the bundle's code signature; plain zip can break it
+        run: ditto -c -k --keepParent mac/KeyBridge.app KeyBridge-mac.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -74,15 +69,18 @@ jobs:
           body: |
             ## KeyBridge ${{ github.ref_name }}
 
-            ### Mac
+            ### Mac (macOS 13+, Apple Silicon & Intel)
             1. Download **KeyBridge-mac.zip**, unzip, and move **KeyBridge.app** to /Applications.
-            2. Double-click to launch — a ⌨️ appears in your menu bar.
-            3. Grant Accessibility access when prompted (System Settings → Privacy & Security → Accessibility).
+            2. Double-click it. The app isn't notarized, so macOS will block it the first time: open
+               **System Settings → Privacy & Security**, scroll down, and click **Open Anyway**.
+            3. Grant Accessibility access when prompted. A ⌨️ appears in your menu bar.
 
-            ### Windows
+            ### Windows (10/11, 64-bit)
             1. Download **keybridge.exe**.
-            2. Run: `keybridge.exe <your-mac-ip>` (find your Mac's IP in System Settings → Wi-Fi → Details).
-            3. A KeyBridge tray icon appears. It connects automatically and reconnects if the Mac restarts.
+            2. Run `keybridge.exe <your-mac-ip>` from a terminal or a shortcut (find your Mac's IP in
+               System Settings → Wi-Fi → Details). SmartScreen may warn since it's unsigned: click
+               **More info → Run anyway**.
+            3. A KeyBridge tray icon appears. It reconnects automatically if the Mac restarts.
 
             ### Switching
             Press **Ctrl + Shift + `** on your Mac keyboard to toggle between Local and Windows mode.

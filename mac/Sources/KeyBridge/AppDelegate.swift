@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import UserNotifications
 
 private let kPort: UInt16 = 9876
@@ -9,52 +10,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let capture = KeyCapture()
     private let server = NetworkServer()
     private var remoteMode = false
+    private var permissionTimer: Timer?
+
+    private var statusLine: NSMenuItem!
+    private var connLine: NSMenuItem!
+    private var toggleItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ n: Notification) {
-        NSApp.setActivationPolicy(.accessory)  // hide from dock
         buildMenu()
-        server.onClientConnected    = { [weak self] ip in self?.onConnect(ip) }
-        server.onClientDisconnected = { [weak self] in self?.onDisconnect() }
-        server.start(port: kPort)
-        capture.onKeyEvent      = { [weak self] evt in self?.server.send(evt) }
-        capture.onHotkeyToggle  = { [weak self] in self?.toggle() }
-        startLocalMode()
 
-        NSApp.activate(ignoringOtherApps: false)
+        if Bundle.main.bundleIdentifier != nil {
+            UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { _, _ in }
+        }
+
+        server.onClientConnected = { [weak self] host in self?.clientConnected(host) }
+        server.onClientDisconnected = { [weak self] in self?.clientDisconnected() }
+        server.start(port: kPort)
+
+        capture.onKeyEvent = { [weak self] evt in self?.server.send(evt) }
+        capture.onHotkeyToggle = { [weak self] in self?.toggle() }
+        startCapture()
+    }
+
+    // MARK: – Accessibility
+
+    private func startCapture() {
+        if capture.start() { updateUI(); return }
+
+        // Shows the system "grant Accessibility" prompt, then retries until the user allows it.
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(opts)
+        statusLine.title = "Needs Accessibility permission…"
+        permissionTimer = Timer.scheduledTimer(timeInterval: 2, target: self,
+                                               selector: #selector(retryCapture), userInfo: nil, repeats: true)
+    }
+
+    @objc private func retryCapture() {
+        guard capture.start() else { return }
+        permissionTimer?.invalidate()
+        permissionTimer = nil
+        updateUI()
     }
 
     // MARK: – Mode
 
-    private func startLocalMode() {
-        remoteMode = false
-        capture.start(suppress: false)
-        updateUI()
-    }
-
-    private func startRemoteMode() {
-        remoteMode = true
-        capture.start(suppress: true)
-        updateUI()
-        if !server.isConnected {
-            notify("No Windows client", "Start KeyBridge on your Windows PC first.")
-        }
-    }
-
     func toggle() {
         if remoteMode {
-            // Release all held keys on remote before we stop capturing
-            capture.flushRemoteKeys(send: server.send)
-            startLocalMode()
+            capture.releaseAllRemote()
+            setRemote(false)
+        } else if server.isConnected {
+            setRemote(true)
         } else {
-            startRemoteMode()
+            notify("No Windows PC connected", "Start keybridge.exe on your PC first.")
         }
+    }
+
+    private func setRemote(_ on: Bool) {
+        remoteMode = on
+        capture.suppress = on
+        updateUI()
+    }
+
+    private func clientConnected(_ host: String) {
+        connLine.title = "Windows: \(host)"
+        notify("Windows PC connected", host)
+    }
+
+    private func clientDisconnected() {
+        connLine.title = "Windows: not connected"
+        if remoteMode { setRemote(false) }
     }
 
     // MARK: – UI
-
-    private var toggleItem: NSMenuItem!
-    private var statusLine: NSMenuItem!
-    private var connLine: NSMenuItem!
 
     private func buildMenu() {
         let menu = NSMenu()
@@ -98,21 +125,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func onToggle() { toggle() }
 
-    private func onConnect(_ ip: String) {
-        connLine.title = "Windows: \(ip)"
-        notify("KeyBridge", "Windows PC connected from \(ip)")
-    }
-
-    private func onDisconnect() {
-        connLine.title = "Windows: disconnected"
-        if remoteMode { startLocalMode() }
-    }
-
-    private func notify(_ title: String, _ body: String = "") {
+    private func notify(_ title: String, _ body: String) {
+        guard Bundle.main.bundleIdentifier != nil else { return }
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(req, withCompletionHandler: nil)
+        UNUserNotificationCenter.current().add(req)
     }
 }

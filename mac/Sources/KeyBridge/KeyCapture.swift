@@ -1,42 +1,39 @@
 import CoreGraphics
 import Foundation
 
-// MARK: – Protocol
-
 struct KeyEvent {
     var isDown: Bool
     var vk: UInt16
-    var isExtended: Bool  // numpad enter needs KEYEVENTF_EXTENDEDKEY on Windows
+    var isExtended: Bool
 }
 
-// C-compatible tap callback; userInfo points to the KeyCapture instance.
 private func tapCallback(
     _ proxy: CGEventTapProxy,
     _ type: CGEventType,
     _ event: CGEvent,
     _ userInfo: UnsafeMutableRawPointer?
 ) -> Unmanaged<CGEvent>? {
-    guard let ptr = userInfo else { return Unmanaged.passRetained(event) }
+    guard let ptr = userInfo else { return Unmanaged.passUnretained(event) }
     let cap = Unmanaged<KeyCapture>.fromOpaque(ptr).takeUnretainedValue()
-    return cap.handle(proxy: proxy, type: type, event: event)
+    return cap.handle(type: type, event: event)
 }
 
-// MARK: – KeyCapture
-
+/// One always-on active event tap. Switching modes just flips `suppress`, so there is no
+/// tap teardown/recreate on toggle and `pressedKeys` keeps mirroring the physical keyboard.
 final class KeyCapture {
     var onKeyEvent: ((KeyEvent) -> Void)?
     var onHotkeyToggle: (() -> Void)?
 
-    private(set) var suppressMode = false
+    /// true = swallow keys locally and forward them; false = let them reach the Mac.
+    var suppress = false
+
     private var tap: CFMachPort?
-    private var loopSource: CFRunLoopSource?
     private var pressedKeys = Set<CGKeyCode>()
 
-    // Start or restart the tap. Call on main thread.
-    func start(suppress: Bool) {
-        stop()
-        suppressMode = suppress
-
+    /// Returns false if the tap could not be created (Accessibility not granted yet).
+    @discardableResult
+    func start() -> Bool {
+        if tap != nil { return true }
         let mask: CGEventMask =
             (1 << CGEventType.keyDown.rawValue) |
             (1 << CGEventType.keyUp.rawValue) |
@@ -45,85 +42,69 @@ final class KeyCapture {
         guard let t = CGEvent.tapCreate(
             tap: .cghidEventTap,
             place: .headInsertEventTap,
-            options: suppress ? .defaultTap : .listenOnly,
+            options: .defaultTap,
             eventsOfInterest: mask,
             callback: tapCallback,
             userInfo: Unmanaged.passUnretained(self).toOpaque()
-        ) else {
-            NSLog("[KeyBridge] CGEventTap creation failed — grant Accessibility in System Settings.")
-            return
-        }
+        ) else { return false }
+
         tap = t
-        loopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, t, 0)
-        CFRunLoopAddSource(CFRunLoopGetMain(), loopSource, .commonModes)
+        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, t, 0)
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: t, enable: true)
+        return true
     }
 
-    func stop() {
-        if let t = tap { CGEvent.tapEnable(tap: t, enable: false) }
-        if let s = loopSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), s, .commonModes) }
-        tap = nil; loopSource = nil
-        pressedKeys.removeAll()
-    }
+    func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        let pass = Unmanaged.passUnretained(event)
 
-    // Called from C tap callback.
-    func handle(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if let t = tap { CGEvent.tapEnable(tap: t, enable: true) }
+            return pass
+        }
+
         let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
 
         switch type {
         case .keyDown:
             pressedKeys.insert(keyCode)
-            if isHotkey() {
-                pressedKeys.removeAll()
+            if keyCode == kBacktick && isHotkeyHeld() {
                 DispatchQueue.main.async { self.onHotkeyToggle?() }
-                return nil  // consume
-            }
-            if suppressMode {
-                dispatch(isDown: true, keyCode: keyCode)
                 return nil
             }
+            if suppress { dispatch(true, keyCode); return nil }
 
         case .keyUp:
             pressedKeys.remove(keyCode)
-            if suppressMode {
-                dispatch(isDown: false, keyCode: keyCode)
-                return nil
-            }
+            if suppress { dispatch(false, keyCode); return nil }
 
         case .flagsChanged:
-            let flags = event.flags
-            if let modFlag = modifierFlags[keyCode] {
-                let isDown = flags.contains(modFlag)
-                if suppressMode {
-                    if isDown { pressedKeys.insert(keyCode) } else { pressedKeys.remove(keyCode) }
-                    dispatch(isDown: isDown, keyCode: keyCode)
-                    return nil
-                }
+            if keyCode == kCapsLock {
+                // macOS reports Caps Lock as a state toggle; Windows toggles on each press.
+                if suppress { dispatch(true, keyCode); dispatch(false, keyCode); return nil }
+                return pass
             }
+            guard let bit = modifierMasks[keyCode] else { return pass }
+            let isDown = event.flags.rawValue & bit != 0
+            if isDown { pressedKeys.insert(keyCode) } else { pressedKeys.remove(keyCode) }
+            if suppress { dispatch(isDown, keyCode); return nil }
 
-        case .tapDisabledByUserInput, .tapDisabledByTimeout:
-            if let t = tap { CGEvent.tapEnable(tap: t, enable: true) }
-
-        default: break
+        default:
+            break
         }
-
-        return Unmanaged.passRetained(event)
+        return pass
     }
 
-    // Release all tracked keys on the remote end before mode switch.
-    func flushRemoteKeys(send: (KeyEvent) -> Void) {
-        for kc in pressedKeys {
-            guard let vk = cgToVk[kc] else { continue }
-            send(KeyEvent(isDown: false, vk: vk, isExtended: kc == kKeypadEnter))
-        }
-        pressedKeys.removeAll()
+    /// Send key-up for everything currently held so nothing sticks on the remote side.
+    func releaseAllRemote() {
+        for kc in pressedKeys { dispatch(false, kc) }
     }
 
-    private func isHotkey() -> Bool {
-        pressedKeys.isSuperset(of: kSwitchHotkey)
+    private func isHotkeyHeld() -> Bool {
+        !pressedKeys.isDisjoint(with: kCtrlKeys) && !pressedKeys.isDisjoint(with: kShiftKeys)
     }
 
-    private func dispatch(isDown: Bool, keyCode: CGKeyCode) {
+    private func dispatch(_ isDown: Bool, _ keyCode: CGKeyCode) {
         guard let vk = cgToVk[keyCode] else { return }
         onKeyEvent?(KeyEvent(isDown: isDown, vk: vk, isExtended: keyCode == kKeypadEnter))
     }

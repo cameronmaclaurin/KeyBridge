@@ -1,0 +1,7 @@
+.DS_Store
+mac/.build/
+mac/.swiftpm/
+mac/KeyBridge.app/
+*.zip
+windows/*.exe
+windows/*.obj

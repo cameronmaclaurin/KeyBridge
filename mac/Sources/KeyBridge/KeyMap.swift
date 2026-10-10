@@ -1,10 +1,13 @@
 import CoreGraphics
 
 // Maps Mac CGKeyCode → Windows Virtual Key code.
-// Switch hotkey is Ctrl (0x3B) + Shift (0x38) + Backtick (0x32).
-let kSwitchHotkey: Set<CGKeyCode> = [0x3B, 0x38, 0x32]
+// Switch hotkey: Ctrl + Shift + ` (either side's Ctrl/Shift).
+let kCtrlKeys: Set<CGKeyCode> = [0x3B, 0x3E]
+let kShiftKeys: Set<CGKeyCode> = [0x38, 0x3C]
+let kBacktick: CGKeyCode = 0x32
+let kCapsLock: CGKeyCode = 0x39
 
-// Extra flag: keypad Enter needs EXTENDEDKEY in SendInput
+// Keypad Enter shares VK_RETURN with Return; Windows tells them apart by EXTENDEDKEY.
 let kKeypadEnter: CGKeyCode = 0x4C
 
 let cgToVk: [CGKeyCode: UInt16] = [
@@ -66,6 +69,7 @@ let cgToVk: [CGKeyCode: UInt16] = [
     0x35: 0x1B,  // Escape
     // ── Modifiers ───────────────────────────────
     0x37: 0x5B,  // Command  → LWin
+    0x36: 0x5C,  // R-Command → RWin
     0x38: 0xA0,  // Shift    → LShift
     0x39: 0x14,  // Caps Lock
     0x3A: 0xA4,  // Option   → LAlt
@@ -113,15 +117,15 @@ let cgToVk: [CGKeyCode: UInt16] = [
     0x7E: 0x26,  // Up
 ]
 
-// Modifier CGKeyCode → its CGEventFlags bit (to detect press vs release from flagsChanged)
-let modifierFlags: [CGKeyCode: CGEventFlags] = [
-    0x37: .maskCommand,    // L-Cmd
-    0x38: .maskShift,      // L-Shift
-    0x3A: .maskAlternate,  // L-Option
-    0x3B: .maskControl,    // L-Ctrl
-    0x3C: .maskShift,      // R-Shift
-    0x3D: .maskAlternate,  // R-Option
-    0x3E: .maskControl,    // R-Ctrl
-    0x36: .maskCommand,    // R-Cmd
-    0x39: .maskAlphaShift, // Caps Lock
+// Modifier CGKeyCode → device-dependent flag bit (NX_DEVICE*KEYMASK). Using per-side bits
+// means releasing R-Shift while L-Shift is held is still seen as a release.
+let modifierMasks: [CGKeyCode: UInt64] = [
+    0x3B: 0x0001,  // L-Ctrl
+    0x38: 0x0002,  // L-Shift
+    0x3C: 0x0004,  // R-Shift
+    0x37: 0x0008,  // L-Cmd
+    0x36: 0x0010,  // R-Cmd
+    0x3A: 0x0020,  // L-Option
+    0x3D: 0x0040,  // R-Option
+    0x3E: 0x2000,  // R-Ctrl
 ]

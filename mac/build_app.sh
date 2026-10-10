@@ -1,20 +1,19 @@
 #!/usr/bin/env bash
-set -e
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR"
+set -euo pipefail
+cd "$(dirname "$0")"
 
-echo "Building KeyBridge (release)…"
-swift build -c release 2>&1
+echo "Building KeyBridge (release, universal)…"
+BUILD_ARGS=(-c release --arch arm64 --arch x86_64)
+swift build "${BUILD_ARGS[@]}"
+BIN="$(swift build "${BUILD_ARGS[@]}" --show-bin-path)/KeyBridge"
 
-BIN=".build/release/KeyBridge"
 APP="KeyBridge.app"
-
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
-cp "$BIN"             "$APP/Contents/MacOS/KeyBridge"
-cp "Resources/Info.plist" "$APP/Contents/Info.plist"
+cp "$BIN" "$APP/Contents/MacOS/KeyBridge"
+cp Resources/Info.plist "$APP/Contents/Info.plist"
 
-echo "Created $SCRIPT_DIR/$APP"
-echo ""
-echo "First run: double-click KeyBridge.app, then grant Accessibility access in"
-echo "  System Settings → Privacy & Security → Accessibility"
+# Ad-hoc sign so macOS ties the Accessibility grant to the app bundle.
+codesign --force --sign - "$APP"
+
+echo "Created $(pwd)/$APP"

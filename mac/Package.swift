@@ -5,11 +5,6 @@ let package = Package(
     name: "KeyBridge",
     platforms: [.macOS(.v13)],
     targets: [
-        .executableTarget(
-            name: "KeyBridge",
-            path: "Sources/KeyBridge",
-            resources: [.copy("../../Resources/Info.plist")],
-            swiftSettings: [.unsafeFlags(["-strict-concurrency=minimal"])]
-        )
+        .executableTarget(name: "KeyBridge", path: "Sources/KeyBridge")
     ]
 )

@@ -86,12 +86,25 @@ static HWND create_tray_window(void) {
 }
 
 /* ── Key injection ───────────────────────────────────────────────────────── */
+/* Without EXTENDEDKEY these are treated as numpad keys, which breaks Shift+Arrow selection. */
+static BOOL is_extended_vk(WORD vk) {
+    switch (vk) {
+    case VK_INSERT: case VK_DELETE: case VK_HOME: case VK_END:
+    case VK_PRIOR:  case VK_NEXT:   case VK_LEFT: case VK_RIGHT:
+    case VK_UP:     case VK_DOWN:   case VK_RCONTROL: case VK_RMENU:
+    case VK_LWIN:   case VK_RWIN:   case VK_DIVIDE:   case VK_NUMLOCK:
+        return TRUE;
+    }
+    return FALSE;
+}
+
 static void inject_key(WORD vk, BOOL extended, BOOL key_down) {
     INPUT inp = {0};
-    inp.type           = INPUT_KEYBOARD;
-    inp.ki.wVk         = vk;
-    inp.ki.dwFlags     = key_down ? 0 : KEYEVENTF_KEYUP;
-    if (extended) inp.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+    inp.type       = INPUT_KEYBOARD;
+    inp.ki.wVk     = vk;
+    inp.ki.wScan   = (WORD)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);  /* games read scan codes */
+    inp.ki.dwFlags = key_down ? 0 : KEYEVENTF_KEYUP;
+    if (extended || is_extended_vk(vk)) inp.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
     SendInput(1, &inp, sizeof(INPUT));
 }
 
