@@ -1,0 +1,20 @@
+version: 2
+updates:
+  # Workflow actions are pinned to commit SHAs; Dependabot bumps the SHA and the version comment.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # The pinned `cryptography` used by the KBP2 reference implementation and interop tests.
+  - package-ecosystem: pip
+    directory: /tests
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7

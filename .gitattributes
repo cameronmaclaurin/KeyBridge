@@ -1,0 +1,8 @@
+* text=auto
+*.bat text eol=crlf
+*.iss text eol=crlf
+*.rc text eol=crlf
+*.manifest text eol=crlf
+*.icns binary
+*.ico binary
+*.png binary

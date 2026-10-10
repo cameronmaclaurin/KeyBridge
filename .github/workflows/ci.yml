@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build and test
+    uses: ./.github/workflows/build.yml
+    with:
+      version: 0.0.0-ci
+      windows-version: 0.0.0
+    # No secrets: CI builds are always unsigned.

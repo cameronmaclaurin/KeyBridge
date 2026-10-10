@@ -1,87 +1,136 @@
-name: Build & Release
+# Tag vX.Y.Z (or vX.Y.Z-suffix for a pre-release) to build, test, attest and publish.
+#
+# Release assets have version-less names so README links to
+# /releases/latest/download/<name> keep working.
+name: Release
 
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  # ── Mac .app ─────────────────────────────────────────────────────────────
-  mac:
-    name: Build Mac app
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build
-        run: mac/build_app.sh
-
-      - name: Zip .app
-        # ditto preserves the bundle's code signature; plain zip can break it
-        run: ditto -c -k --keepParent mac/KeyBridge.app KeyBridge-mac.zip
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: mac-app
-          path: KeyBridge-mac.zip
-
-  # ── Windows .exe ─────────────────────────────────────────────────────────
-  windows:
-    name: Build Windows exe
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build with MSVC
-        shell: cmd
-        run: |
-          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VS=%%i
-          call "%VS%\VC\Auxiliary\Build\vcvars64.bat"
-          cd windows
-          cl /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS keybridge.c ws2_32.lib user32.lib shell32.lib gdi32.lib /link /SUBSYSTEM:WINDOWS /OUT:keybridge.exe
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-exe
-          path: windows/keybridge.exe
-
-  # ── GitHub Release ────────────────────────────────────────────────────────
-  release:
-    name: Publish release
-    needs: [mac, windows]
+  meta:
+    name: Version from tag
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      windows-version: ${{ steps.version.outputs.windows-version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
-      - uses: actions/download-artifact@v4
-        with: { name: mac-app }
-      - uses: actions/download-artifact@v4
-        with: { name: windows-exe }
+      - name: Parse tag
+        id: version
+        shell: bash
+        run: |
+          tag="$GITHUB_REF_NAME"
+          version="${tag#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "::error::Tag '$tag' must look like v1.2.3 or v1.2.3-beta.1"
+            exit 1
+          fi
+          windows_version="${version%%-*}"
+          prerelease=false
+          [[ "$version" == *-* ]] && prerelease=true
+          {
+            echo "version=$version"
+            echo "windows-version=$windows_version"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          echo "version=$version windows-version=$windows_version prerelease=$prerelease"
 
-      - name: Create release
-        uses: softprops/action-gh-release@v2
+  build:
+    name: Build and test
+    needs: meta
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ needs.meta.outputs.version }}
+      windows-version: ${{ needs.meta.outputs.windows-version }}
+    # Signing is optional: missing secrets arrive empty and the build stays unsigned.
+    secrets:
+      MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
+      MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+      MAC_INSTALLER_CERT_P12_BASE64: ${{ secrets.MAC_INSTALLER_CERT_P12_BASE64 }}
+      MAC_INSTALLER_CERT_PASSWORD: ${{ secrets.MAC_INSTALLER_CERT_PASSWORD }}
+      MAC_NOTARY_APPLE_ID: ${{ secrets.MAC_NOTARY_APPLE_ID }}
+      MAC_NOTARY_TEAM_ID: ${{ secrets.MAC_NOTARY_TEAM_ID }}
+      MAC_NOTARY_PASSWORD: ${{ secrets.MAC_NOTARY_PASSWORD }}
+      WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+      WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+
+  release:
+    name: Publish GitHub release
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # create the release and upload assets
+      id-token: write # sign build-provenance attestations (Sigstore)
+      attestations: write # store the attestations
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+          sparse-checkout: .github
+
+      - name: Download macOS packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: mac-dist
+          path: assets
+
+      - name: Download Windows binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-dist
+          path: assets
+
+      - name: Write SHA256SUMS.txt
+        working-directory: assets
+        run: |
+          files=(KeyBridge-macOS.pkg KeyBridge-macOS.dmg KeyBridge-Windows-Setup.exe KeyBridge-Windows-Portable.exe)
+          for f in "${files[@]}"; do
+            [ -f "$f" ] || { echo "::error::Missing release asset $f"; ls -la; exit 1; }
+          done
+          sha256sum "${files[@]}" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            assets/KeyBridge-macOS.pkg
+            assets/KeyBridge-macOS.dmg
+            assets/KeyBridge-Windows-Setup.exe
+            assets/KeyBridge-Windows-Portable.exe
+            assets/SHA256SUMS.txt
+
+      - name: Render release notes
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: sed "s/{{VERSION}}/${VERSION}/g" .github/release-notes.md > "$RUNNER_TEMP/release-notes.md"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          name: KeyBridge ${{ needs.meta.outputs.version }}
+          body_path: ${{ runner.temp }}/release-notes.md
+          prerelease: ${{ needs.meta.outputs.prerelease == 'true' }}
+          make_latest: ${{ needs.meta.outputs.prerelease == 'true' && 'false' || 'true' }}
+          fail_on_unmatched_files: true
           files: |
-            KeyBridge-mac.zip
-            keybridge.exe
-          body: |
-            ## KeyBridge ${{ github.ref_name }}
-
-            ### Mac (macOS 13+, Apple Silicon & Intel)
-            1. Download **KeyBridge-mac.zip**, unzip, and move **KeyBridge.app** to /Applications.
-            2. Double-click it. The app isn't notarized, so macOS will block it the first time: open
-               **System Settings → Privacy & Security**, scroll down, and click **Open Anyway**.
-            3. Grant Accessibility access when prompted. A ⌨️ appears in your menu bar.
-
-            ### Windows (10/11, 64-bit)
-            1. Download **keybridge.exe**.
-            2. Run `keybridge.exe <your-mac-ip>` from a terminal or a shortcut (find your Mac's IP in
-               System Settings → Wi-Fi → Details). SmartScreen may warn since it's unsigned: click
-               **More info → Run anyway**.
-            3. A KeyBridge tray icon appears. It reconnects automatically if the Mac restarts.
-
-            ### Switching
-            Press **Ctrl + Shift + `** on your Mac keyboard to toggle between Local and Windows mode.
-            Or click the ⌨️ menu bar icon.
+            assets/KeyBridge-macOS.pkg
+            assets/KeyBridge-macOS.dmg
+            assets/KeyBridge-Windows-Setup.exe
+            assets/KeyBridge-Windows-Portable.exe
+            assets/SHA256SUMS.txt

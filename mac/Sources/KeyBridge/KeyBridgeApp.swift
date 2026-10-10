@@ -4,6 +4,12 @@ import AppKit
 @MainActor
 enum KeyBridgeApp {
     static func main() {
+        #if KEYBRIDGE_SELFTEST
+        if CommandLine.arguments.contains("--selftest-server") {
+            SelfTest.runServer(CommandLine.arguments)  // never returns
+        }
+        #endif
+
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate
