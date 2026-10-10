@@ -1,4 +1,5 @@
 import AppKit
+import UserNotifications
 
 private let kPort: UInt16 = 9876
 
@@ -108,9 +109,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func notify(_ title: String, _ body: String = "") {
-        let n = NSUserNotification()
-        n.title = title
-        n.informativeText = body
-        NSUserNotificationCenter.default.deliver(n)
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(req, withCompletionHandler: nil)
     }
 }
