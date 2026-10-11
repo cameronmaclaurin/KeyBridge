@@ -16,6 +16,8 @@ MARKERS = [
     "--selftest-pair-server",
     "--selftest-pair-client",
     "--selftest-discover",
+    "--selftest-verify-update",
+    "--preview",  # Windows UI preview build (KEYBRIDGE_UI_PREVIEW) only
 ]
 
 

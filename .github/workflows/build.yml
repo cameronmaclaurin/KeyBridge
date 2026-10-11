@@ -330,7 +330,18 @@ jobs:
         shell: pwsh
         run: python tests\check_no_selftest.py windows\build\KeyBridge.exe
 
-      - name: Screenshot KeyBridge windows (for UI review)
+      # UI preview build (KEYBRIDGE_UI_PREVIEW): same app code, fake state, no networking.
+      # Only built when build.bat supports it; never shipped.
+      - name: Build UI preview exe (MSVC)
+        shell: cmd
+        run: |
+          findstr /i /c:"preview" "%GITHUB_WORKSPACE%\windows\build.bat" >nul || (echo build.bat has no preview mode yet & exit /b 0)
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%i"
+          call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat"
+          call "%GITHUB_WORKSPACE%\windows\build.bat" %WIN_VERSION% preview
+          if errorlevel 1 exit /b 1
+
+      - name: Screenshot KeyBridge UI (for review)
         shell: pwsh
         run: |
           Add-Type -AssemblyName System.Windows.Forms, System.Drawing
@@ -340,17 +351,38 @@ jobs:
             $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
             $g = [System.Drawing.Graphics]::FromImage($bmp)
             $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
-            $bmp.Save("screenshots\$name.png", [System.Drawing.Imaging.ImageFormat]::Png)
-            $g.Dispose(); $bmp.Dispose()
+            $bmp.Save("screenshots\$name-full.png", [System.Drawing.Imaging.ImageFormat]::Png)
+            # Close-up of the bottom-right corner, where the tray flyout opens.
+            $w = [Math]::Min(600, $b.Width); $h = [Math]::Min(760, $b.Height)
+            $crop = $bmp.Clone((New-Object System.Drawing.Rectangle ($b.Width - $w), ($b.Height - $h), $w, $h), $bmp.PixelFormat)
+            $crop.Save("screenshots\$name.png", [System.Drawing.Imaging.ImageFormat]::Png)
+            $crop.Dispose(); $g.Dispose(); $bmp.Dispose()
           }
-          foreach ($run in @(@{ name = "setup"; args = @() }, @{ name = "settings"; args = @("--show-settings") })) {
-            $p = if ($run.args.Count) { Start-Process windows\build\KeyBridge.exe -ArgumentList $run.args -PassThru } else { Start-Process windows\build\KeyBridge.exe -PassThru }
-            Start-Sleep -Seconds 5
-            Shot $run.name
+          function SetTheme($light) {
+            $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+            New-Item -Force -Path $k | Out-Null
+            Set-ItemProperty -Path $k -Name AppsUseLightTheme -Value $light -Type DWord
+            Set-ItemProperty -Path $k -Name SystemUsesLightTheme -Value $light -Type DWord
+            Start-Sleep -Seconds 2
+          }
+          function Run($exe, $argList, $name) {
+            $p = if ($argList.Count) { Start-Process $exe -ArgumentList $argList -PassThru } else { Start-Process $exe -PassThru }
+            Start-Sleep -Seconds 4
+            Shot $name
             if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
-            Start-Sleep -Seconds 1
+            Start-Sleep -Milliseconds 800
           }
-          Get-ChildItem screenshots
+          $preview = "windows\build\KeyBridge-preview.exe"
+          $states = @("unpaired-searching", "unpaired-found", "compare", "paired-connected", "paired-disconnected", "update-available", "settings")
+          foreach ($theme in @(@{ name = "light"; v = 1 }, @{ name = "dark"; v = 0 })) {
+            SetTheme $theme.v
+            if (Test-Path $preview) {
+              foreach ($st in $states) { Run $preview @("--preview", $st) "$($theme.name)-$st" }
+            }
+          }
+          SetTheme 1
+          Run "windows\build\KeyBridge.exe" @() "shipping-first-run"
+          Get-ChildItem screenshots | Select-Object Name, Length
 
       - name: Upload screenshots
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

@@ -4,12 +4,15 @@
  * Receives keystrokes from the KeyBridge Mac app over an authenticated,
  * encrypted KBP2 connection (docs/PROTOCOL.md) and types them on this PC.
  *
- * Threads: the UI thread owns the hidden window, the tray icon and the
- * dialogs; worker.c owns the session connection and injects keys; a
- * short-lived pairing thread runs pairing.c while the setup dialog is open;
- * DNS-SD callbacks (discovery.c) only queue events; update checks and
- * downloads (update.c) run on short-lived threads of their own. Background
- * threads never touch UI objects: they post messages to the UI thread.
+ * Threads: the UI thread owns the hidden window, the tray icon and the tray
+ * flyout (flyout.cpp); worker.c owns the session connection and injects
+ * keys; a short-lived pairing thread runs pairing.c; DNS-SD callbacks
+ * (discovery.c) only queue events; update checks and downloads (update.c)
+ * run on short-lived threads of their own. Background threads never touch UI
+ * objects: they post messages to the UI thread.
+ *
+ * The flyout only draws: this file decides what it shows (ui_sync fills a
+ * fly_state) and acts on what the user asks for (on_fly_action).
  */
 #include "common.h"
 
@@ -19,7 +22,7 @@
 #include <winhttp.h> /* ERROR_WINHTTP_* codes only */
 
 #include "resource.h"
-#include "ui.h"      /* dialog look and feel (static helpers; not its own .c) */
+#include "flyout.h"
 #include "kbutil.h"
 #include "crypto.h"
 #include "kbp2.h"
@@ -42,40 +45,34 @@
 
 #define WM_KB_TRAY     (WM_APP + 1)  /* tray icon callback */
 #define WM_KB_STATUS   (WM_APP + 2)  /* worker: wParam = generation, lParam = kb_status */
-#define WM_KB_PAIR     (WM_APP + 3)  /* pairing thread -> setup dialog: wParam = job gen, lParam = event */
-#define WM_KB_DISC     (WM_APP + 4)  /* discovery events queued -> setup dialog */
+#define WM_KB_PAIR     (WM_APP + 3)  /* pairing thread: wParam = job gen, lParam = event */
+#define WM_KB_DISC     (WM_APP + 4)  /* discovery events queued */
 #define WM_KB_UPDATE   (WM_APP + 5)  /* update job finished: lParam = job id */
 
 #define KB_PAIR_EV_SAS  1
 #define KB_PAIR_EV_DONE 2
 
-#define KB_TRAY_UID        1
-#define KB_TIMER_TRAY      1   /* on the hidden window */
-#define KB_TIMER_RESOLVE   2   /* on the setup dialog */
-#define KB_TIMER_UPD_FIRST 3   /* on the hidden window: first update check after launch */
-#define KB_TIMER_UPD_POLL  4   /* on the hidden window: is an update check due? */
+#define KB_TRAY_UID            1
+#define KB_TIMER_TRAY          1   /* all on the hidden window */
+#define KB_TIMER_RESOLVE       2
+#define KB_TIMER_UPD_FIRST     3   /* first update check after launch */
+#define KB_TIMER_UPD_POLL      4   /* is an update check due? */
+#define KB_TIMER_DISC_EMPTY    5   /* "No Macs found" after this long */
+#define KB_TIMER_PAIR_OK       6   /* "Paired with ..." stays this long */
+#define KB_TIMER_UPD_PROGRESS  7   /* download progress */
 #define KB_TRAY_RETRY_MS   2000
 #define KB_RESOLVE_WAIT_MS 6000
+#define KB_DISC_EMPTY_MS   8000
+#define KB_PAIR_OK_MS      1500
 #define KB_UPD_FIRST_MS    10000u          /* docs/UPDATES.md: 10 s after launch */
 #define KB_UPD_POLL_MS     (60u * 60u * 1000u)
 #define KB_UPD_INTERVAL_S  (24u * 60u * 60u) /* then every 24 h */
 
 #define KB_MAX_MACS        32
-#define KB_PLACEHOLDER     1000  /* list item data of the "Searching..." line */
 
-#define IDM_STATUS     40001  /* bold header line: opens Settings (or Setup) */
-#define IDM_PAIR       40002
-#define IDM_QUIT       40005
-#define IDM_CHECK_UPDATES 40006
-#define IDM_INSTALL_UPDATE 40008
-#define IDM_SETTINGS   40009
-
-/* Task dialog button ids. */
-#define KB_TD_INSTALL     100
-#define KB_TD_LATER       101
-#define KB_TD_SKIP        102
-#define KB_TD_DOWNLOAD    103
-#define KB_TD_FORGET      104
+#define IDM_OPEN       40001
+#define IDM_SETTINGS   40002
+#define IDM_QUIT       40003
 
 #define KB_FLAG_SHOW_SETTINGS L"--show-settings"
 
@@ -104,13 +101,12 @@
 
 static HINSTANCE g_inst;
 static HWND      g_hwnd;
-static HWND      g_setup;      /* setup dialog, while open */
-static HWND      g_compare;    /* compare dialog, while open */
 static UINT      g_msg_taskbar_created;
 static UINT      g_msg_show_settings;
 static BOOL      g_tray_added;
 static BOOL      g_quitting;
 static BOOL      g_paired;     /* a pairing is stored and the worker was started */
+static BOOL      g_first_run;  /* there was no pairing when KeyBridge started */
 static BOOL      g_not_paired_notified;
 static BOOL      g_skip_connected_balloon;
 static kb_status g_status = KB_ST_NONE;
@@ -120,21 +116,27 @@ static HICON     g_icon_on;
 static HICON     g_icon_off;
 static HICON     g_icon_app_small;
 static HICON     g_icon_app_large;
+/* The flyout (UI thread only). */
+static BOOL      g_fly_ok;             /* flyout_init succeeded */
+static fly_state g_fs;                 /* what it shows */
+static BOOL      g_disc_available;     /* this Windows has the DNS-SD APIs */
+static BOOL      g_pref_autostart, g_pref_clipboard, g_pref_autoupdate;
+static fly_sev   g_notice_sev;
+static wchar_t   g_notice_title[FLY_MSG_MAX], g_notice_text[FLY_MSG_MAX];
 /* Updates (UI thread only). */
 static kb_upd_job *g_upd_check;        /* check in progress */
 static BOOL      g_upd_check_manual;   /* report its result (the user asked) */
-static BOOL      g_upd_ui;             /* the update prompt or progress is open */
-static HWND      g_upd_dialog;         /* that task dialog's window */
-static kb_update_manifest *g_upd_pending; /* found by an automatic check, not acted on yet */
+static kb_update_manifest *g_upd_pending; /* a newer version that was found */
+static BOOL      g_upd_offer;          /* offer g_upd_pending in the flyout */
+static kb_upd_job *g_upd_download;     /* download in progress */
+static int       g_upd_permille = -1;
+static BOOL      g_upd_installing;
+static BOOL      g_upd_failed;         /* the last manual check or download failed */
+static wchar_t   g_upd_error[FLY_MSG_MAX];
+static wchar_t   g_upd_note[FLY_MSG_MAX]; /* "You're up to date" after a manual check */
 static BOOL      g_balloon_update;     /* the last balloon announced an update */
-/* Settings (modeless; UI thread only). */
-static HWND      g_settings;
-static int       g_settings_modal;     /* modal windows owned by Settings that are open */
-static ui_state  g_ui_setup, g_ui_compare, g_ui_settings;
 
-static INT_PTR show_setup(BOOL first_run);
-static void show_settings(void);
-static void settings_refresh(void);
+static void ui_sync(void);
 
 /* ------------------------------------------------------------------------ */
 /* Icons, status text                                                       */
@@ -161,14 +163,6 @@ static void load_icons(void)
         g_icon_on = g_icon_app_small;
     if (g_icon_off == NULL)
         g_icon_off = g_icon_app_small;
-}
-
-static void set_dialog_icons(HWND dlg)
-{
-    if (g_icon_app_large != NULL)
-        SendMessageW(dlg, WM_SETICON, ICON_BIG, (LPARAM)g_icon_app_large);
-    if (g_icon_app_small != NULL)
-        SendMessageW(dlg, WM_SETICON, ICON_SMALL, (LPARAM)g_icon_app_small);
 }
 
 /* The paired Mac as shown to the user: its name, else its address. */
@@ -209,6 +203,21 @@ static void status_text(wchar_t *buf, size_t cap)
     }
 }
 
+/* A message in the flyout (errors that used to be message boxes). */
+static void notice_set(fly_sev sev, const wchar_t *title, const wchar_t *text)
+{
+    g_notice_sev = sev;
+    (void)StringCchCopyW(g_notice_title, ARRAYSIZE(g_notice_title), title != NULL ? title : L"");
+    (void)StringCchCopyW(g_notice_text, ARRAYSIZE(g_notice_text), text != NULL ? text : L"");
+}
+
+static void notice_clear(void)
+{
+    g_notice_sev = FLY_SEV_NONE;
+    g_notice_title[0] = 0;
+    g_notice_text[0] = 0;
+}
+
 /* ------------------------------------------------------------------------ */
 /* Tray icon                                                                */
 /* ------------------------------------------------------------------------ */
@@ -247,11 +256,11 @@ static BOOL tray_add(void)
 }
 
 /* The pairing or the connection state changed: update the icon, the
- * tooltip and Settings. */
+ * tooltip and the flyout. */
 static void tray_update(void)
 {
     NOTIFYICONDATAW nid;
-    settings_refresh();
+    ui_sync();
     if (!g_tray_added)
         return;
     tray_init(&nid);
@@ -302,7 +311,7 @@ static void on_status(kb_status st)
         g_not_paired_notified = FALSE;
         if (g_skip_connected_balloon)
             g_skip_connected_balloon = FALSE; /* "Paired with ..." was just shown */
-        else
+        else if (!flyout_visible())
             tray_balloon(L"Connected to your Mac",
                          L"Switch your Mac to Windows mode to type on this PC.", FALSE);
     } else if (st == KB_ST_NOT_PAIRED) {
@@ -314,7 +323,7 @@ static void on_status(kb_status st)
             tray_balloon(L"Pair with your Mac again",
                          L"Your Mac no longer recognizes this PC. Click here to pair again.", TRUE);
         }
-    } else if (prev == KB_ST_CONNECTED) {
+    } else if (prev == KB_ST_CONNECTED && !flyout_visible()) {
         tray_balloon(L"Disconnected from your Mac", L"KeyBridge will reconnect on its own.", FALSE);
     }
 }
@@ -361,159 +370,20 @@ static void stop_session(void)
     tray_update();
 }
 
-/* ------------------------------------------------------------------------ */
-/* Modal windows and messages                                               */
-/* ------------------------------------------------------------------------ */
-
-/* While Settings is open, modal windows (Setup, questions, the update
- * prompt) are owned by it: it is disabled meanwhile, and app_shutdown does
- * not destroy it from under their modal loops. Pair every call with
- * modal_end. Returns the owner to use (may be NULL). */
-static HWND modal_begin(void)
-{
-    if (g_settings == NULL || !IsWindowEnabled(g_settings))
-        return NULL; /* already owned by another modal window */
-    g_settings_modal++;
-    return g_settings;
-}
-
-static void modal_end(HWND owner)
-{
-    if (owner != NULL && g_settings_modal > 0)
-        g_settings_modal--;
-}
-
-static HRESULT CALLBACK notice_cb(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LONG_PTR data)
-{
-    UNREFERENCED_PARAMETER(wp);
-    UNREFERENCED_PARAMETER(lp);
-    UNREFERENCED_PARAMETER(data);
-    if (msg == TDN_CREATED) {
-        set_dialog_icons(hwnd);
-        ui_title_bar(hwnd, FALSE);
-        SetForegroundWindow(hwnd);
-    }
-    return S_OK;
-}
-
-/* A short message in a task dialog: a main instruction and optional detail. */
-static void kb_notice(const wchar_t *instruction, const wchar_t *content, BOOL warning)
-{
-    TASKDIALOGCONFIG tdc;
-    HWND owner = modal_begin();
-
-    memset(&tdc, 0, sizeof(tdc));
-    tdc.cbSize = (UINT)sizeof(tdc);
-    tdc.hwndParent = owner;
-    tdc.hInstance = g_inst;
-    tdc.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | (owner != NULL ? TDF_POSITION_RELATIVE_TO_WINDOW : 0);
-    tdc.dwCommonButtons = TDCBF_OK_BUTTON;
-    tdc.pszWindowTitle = KB_APP_NAME;
-    if (warning) {
-        tdc.pszMainIcon = TD_WARNING_ICON;
-    } else if (g_icon_app_large != NULL) {
-        tdc.dwFlags |= TDF_USE_HICON_MAIN;
-        tdc.hMainIcon = g_icon_app_large;
-    }
-    tdc.pszMainInstruction = instruction;
-    tdc.pszContent = content;
-    tdc.pfCallback = notice_cb;
-    if (FAILED(TaskDialogIndirect(&tdc, NULL, NULL, NULL))) {
-        wchar_t text[512];
-        (void)StringCchPrintfW(text, ARRAYSIZE(text), L"%ls%ls%ls", instruction,
-                               content != NULL ? L"\n\n" : L"", content != NULL ? content : L"");
-        MessageBoxW(owner, text, KB_APP_NAME,
-                    MB_OK | (warning ? MB_ICONWARNING : MB_ICONINFORMATION) | MB_SETFOREGROUND);
-    }
-    modal_end(owner);
-}
-
+/* Forget the paired Mac (the flyout asked first). */
 static void forget_mac(void)
 {
-    TASKDIALOGCONFIG tdc;
-    TASKDIALOG_BUTTON forget;
-    wchar_t title[KB_NAME_MAX + 32];
-    int choice = IDCANCEL;
-    HWND owner;
-
-    if (!g_paired)
+    if (!g_paired || g_quitting)
         return;
-    (void)StringCchPrintfW(title, ARRAYSIZE(title), L"Forget %ls?", mac_label());
-    forget.nButtonID = KB_TD_FORGET;
-    forget.pszButtonText = L"Forget";
-    owner = modal_begin();
-    memset(&tdc, 0, sizeof(tdc));
-    tdc.cbSize = (UINT)sizeof(tdc);
-    tdc.hwndParent = owner;
-    tdc.hInstance = g_inst;
-    tdc.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | (owner != NULL ? TDF_POSITION_RELATIVE_TO_WINDOW : 0);
-    tdc.pszWindowTitle = KB_APP_NAME;
-    if (g_icon_app_large != NULL) {
-        tdc.dwFlags |= TDF_USE_HICON_MAIN;
-        tdc.hMainIcon = g_icon_app_large;
-    }
-    tdc.pszMainInstruction = title;
-    tdc.pszContent = L"KeyBridge will disconnect from it. To use this PC with a Mac again, "
-                     L"you\x2019ll need to pair again.";
-    tdc.cButtons = 1;
-    tdc.pButtons = &forget;
-    tdc.dwCommonButtons = TDCBF_CANCEL_BUTTON;
-    tdc.nDefaultButton = IDCANCEL; /* destructive: never the default */
-    tdc.pfCallback = notice_cb;
-    if (FAILED(TaskDialogIndirect(&tdc, &choice, NULL, NULL))) {
-        wchar_t question[KB_NAME_MAX + 160];
-        (void)StringCchPrintfW(question, ARRAYSIZE(question),
-                               L"%ls\n\nKeyBridge will disconnect from it. To use this PC with a Mac "
-                               L"again, you\x2019ll need to pair again.", title);
-        choice = MessageBoxW(owner, question, KB_APP_NAME,
-                             MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_SETFOREGROUND) == IDYES
-                     ? KB_TD_FORGET : IDCANCEL;
-    }
-    modal_end(owner);
-    if (choice != KB_TD_FORGET || !g_paired || g_quitting)
-        return; /* cancelled, or something changed while the question was up */
     stop_session();
     if (!config_delete())
-        kb_notice(L"Couldn\x2019t forget this Mac", L"KeyBridge couldn\x2019t delete its saved pairing.",
-                  TRUE);
-}
-
-static void app_shutdown(void)
-{
-    if (g_quitting)
-        return;
-    g_quitting = TRUE;
-    if (g_compare != NULL)
-        EndDialog(g_compare, IDCANCEL);
-    if (g_setup != NULL)
-        EndDialog(g_setup, IDCANCEL);
-    if (g_upd_dialog != NULL)
-        SendMessageW(g_upd_dialog, TDM_CLICK_BUTTON, IDCANCEL, 0);
-    if (g_settings != NULL) {
-        if (g_settings_modal == 0)
-            DestroyWindow(g_settings);
-        else
-            ShowWindow(g_settings, SW_HIDE); /* a modal loop it owns is still unwinding */
-    }
-    if (g_hwnd != NULL) {
-        KillTimer(g_hwnd, KB_TIMER_TRAY);
-        KillTimer(g_hwnd, KB_TIMER_UPD_FIRST);
-        KillTimer(g_hwnd, KB_TIMER_UPD_POLL);
-    }
-    if (g_upd_check != NULL) {
-        kb_upd_job_release(g_upd_check); /* cancels it */
-        g_upd_check = NULL;
-    }
-    worker_stop(3000); /* the worker releases every held key before exiting */
-    tray_remove();
+        notice_set(FLY_SEV_CRITICAL, L"Couldn\x2019t forget this Mac",
+                   L"KeyBridge couldn\x2019t delete its saved pairing.");
+    ui_sync();
 }
 
 static void request_quit(void)
 {
-    if (g_compare != NULL)
-        EndDialog(g_compare, IDCANCEL);
-    if (g_setup != NULL)
-        EndDialog(g_setup, IDCANCEL);
     PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
 }
 
@@ -584,7 +454,7 @@ static DWORD WINAPI pair_thread(LPVOID param)
 }
 
 /* ------------------------------------------------------------------------ */
-/* Setup dialog                                                             */
+/* Pairing and discovery state (what the flyout's pair page shows)          */
 /* ------------------------------------------------------------------------ */
 
 typedef struct {
@@ -596,138 +466,62 @@ typedef struct {
     unsigned short port;
 } mac_entry;
 
-/* One setup dialog at a time; UI thread only. */
+/* UI thread only. */
 static struct {
-    BOOL      discovery;           /* the list is in use */
+    BOOL      discovery;           /* browsing */
+    BOOL      want_discovery;      /* the flyout shows the Mac list */
+    BOOL      empty;               /* browsed for a while and found nothing */
     mac_entry macs[KB_MAX_MACS];
     int       waiting_entry;       /* resolving this entry before pairing, or -1 */
     pair_job *job;                 /* pairing in progress (the UI's reference) */
     WPARAM    job_gen;
     BOOL      sas_shown;
+    fly_pair  state;
+    int       target;              /* entry being paired, -1 = typed address */
+    uint32_t  sas;
+    wchar_t   name[KB_NAME_MAX + 1];    /* the Mac's name while comparing */
     wchar_t   address[KB_HOST_MAX + 1]; /* stored on success (fits kb_config.host) */
-    wchar_t   target[KB_HOST_MAX + 1];  /* shown while connecting */
-} g_su;
+    wchar_t   target_label[KB_HOST_MAX + 1]; /* shown while connecting */
+} g_pair;
 
-static void set_status(HWND dlg, const wchar_t *text)
+static BOOL pair_busy(void)
 {
-    SetDlgItemTextW(dlg, IDC_SETUP_STATUS, text);
-}
-
-static BOOL setup_busy(void)
-{
-    return g_su.job != NULL || g_su.waiting_entry >= 0;
-}
-
-static int selected_entry(HWND dlg)
-{
-    HWND list = GetDlgItem(dlg, IDC_MAC_LIST);
-    LRESULT sel, data;
-
-    if (!g_su.discovery)
-        return -1;
-    sel = SendMessageW(list, LB_GETCURSEL, 0, 0);
-    if (sel == LB_ERR)
-        return -1;
-    data = SendMessageW(list, LB_GETITEMDATA, (WPARAM)sel, 0);
-    if (data < 0 || data >= KB_MAX_MACS || !g_su.macs[data].used)
-        return -1;
-    return (int)data;
-}
-
-static void update_controls(HWND dlg)
-{
-    BOOL busy = setup_busy();
-    BOOL can_pair = !busy && (selected_entry(dlg) >= 0 ||
-                              GetWindowTextLengthW(GetDlgItem(dlg, IDC_HOST)) > 0);
-
-    HWND focus;
-
-    EnableWindow(GetDlgItem(dlg, IDC_MAC_LIST), !busy);
-    EnableWindow(GetDlgItem(dlg, IDC_HOST), !busy);
-    EnableWindow(GetDlgItem(dlg, IDC_AUTOSTART), !busy);
-    EnableWindow(GetDlgItem(dlg, IDOK), can_pair);
-    /* Never leave the keyboard focus on a control that was just disabled. */
-    focus = GetFocus();
-    if (busy && (focus == NULL || !IsWindowEnabled(focus)))
-        SendMessageW(dlg, WM_NEXTDLGCTL, (WPARAM)GetDlgItem(dlg, IDCANCEL), TRUE);
-}
-
-static int list_find(HWND list, LPARAM data)
-{
-    int i, n = (int)SendMessageW(list, LB_GETCOUNT, 0, 0);
-    for (i = 0; i < n; i++) {
-        if (SendMessageW(list, LB_GETITEMDATA, (WPARAM)i, 0) == data)
-            return i;
-    }
-    return -1;
-}
-
-/* "Searching..." while the list has no Macs in it. */
-static void update_placeholder(HWND dlg)
-{
-    HWND list = GetDlgItem(dlg, IDC_MAC_LIST);
-    int n = (int)SendMessageW(list, LB_GETCOUNT, 0, 0);
-    int ph = list_find(list, KB_PLACEHOLDER);
-
-    if (ph >= 0 && n > 1) {
-        SendMessageW(list, LB_DELETESTRING, (WPARAM)ph, 0);
-    } else if (ph < 0 && n == 0) {
-        LRESULT i = SendMessageW(list, LB_ADDSTRING, 0, (LPARAM)L"Searching\x2026");
-        if (i >= 0)
-            SendMessageW(list, LB_SETITEMDATA, (WPARAM)i, KB_PLACEHOLDER);
-    }
+    return g_pair.job != NULL || g_pair.waiting_entry >= 0;
 }
 
 static int entry_find(const wchar_t *instance)
 {
     int i;
     for (i = 0; i < KB_MAX_MACS; i++) {
-        if (g_su.macs[i].used &&
-            CompareStringOrdinal(g_su.macs[i].instance, -1, instance, -1, TRUE) == CSTR_EQUAL)
+        if (g_pair.macs[i].used &&
+            CompareStringOrdinal(g_pair.macs[i].instance, -1, instance, -1, TRUE) == CSTR_EQUAL)
             return i;
     }
     return -1;
 }
 
-static int entry_add(HWND dlg, const wchar_t *instance)
+static int entry_add(const wchar_t *instance)
 {
-    HWND list = GetDlgItem(dlg, IDC_MAC_LIST);
     mac_entry *e;
-    LRESULT pos;
     int i;
 
     i = entry_find(instance);
     if (i >= 0)
         return i;
-    for (i = 0; i < KB_MAX_MACS && g_su.macs[i].used; i++)
+    for (i = 0; i < KB_MAX_MACS && g_pair.macs[i].used; i++)
         ;
     if (i == KB_MAX_MACS)
         return -1;
-    e = &g_su.macs[i];
+    e = &g_pair.macs[i];
     memset(e, 0, sizeof(*e));
     if (FAILED(StringCchCopyW(e->instance, ARRAYSIZE(e->instance), instance)))
         return -1;
     discovery_label(instance, e->label, ARRAYSIZE(e->label));
     if (e->label[0] == 0)
         (void)StringCchCopyNW(e->label, ARRAYSIZE(e->label), instance, KB_NAME_MAX);
-    pos = SendMessageW(list, LB_ADDSTRING, 0, (LPARAM)e->label);
-    if (pos < 0)
-        return -1;
-    SendMessageW(list, LB_SETITEMDATA, (WPARAM)pos, (LPARAM)i);
     e->used = TRUE;
-    update_placeholder(dlg);
+    g_pair.empty = FALSE;
     return i;
-}
-
-static void entry_remove(HWND dlg, int i)
-{
-    HWND list = GetDlgItem(dlg, IDC_MAC_LIST);
-    int pos = list_find(list, (LPARAM)i);
-
-    if (pos >= 0)
-        SendMessageW(list, LB_DELETESTRING, (WPARAM)pos, 0);
-    memset(&g_su.macs[i], 0, sizeof(g_su.macs[i]));
-    update_placeholder(dlg);
 }
 
 /* "host" or "host:port" ("[v6]:port") for an entry. */
@@ -741,142 +535,177 @@ static BOOL entry_address(const mac_entry *e, wchar_t *out, size_t cap)
     return SUCCEEDED(StringCchPrintfW(out, cap, L"%ls:%u", e->host, port));
 }
 
-/* Back to the idle Setup state with a message. */
-static void pair_failed(HWND dlg, const wchar_t *detail)
+static void disc_stop_now(void)
 {
-    wchar_t text[256];
-
-    if (g_su.waiting_entry >= 0) {
-        KillTimer(dlg, KB_TIMER_RESOLVE);
-        g_su.waiting_entry = -1;
+    if (!g_pair.discovery)
+        return;
+    KillTimer(g_hwnd, KB_TIMER_DISC_EMPTY);
+    discovery_stop();
+    g_pair.discovery = FALSE;
+    g_pair.empty = FALSE;
+    if (g_pair.state != FLY_PAIR_BUSY || g_pair.target < 0) {
+        memset(g_pair.macs, 0, sizeof(g_pair.macs));
+    } else {
+        /* Keep the row being paired; drop the rest. */
+        int i;
+        for (i = 0; i < KB_MAX_MACS; i++) {
+            if (i != g_pair.target)
+                memset(&g_pair.macs[i], 0, sizeof(g_pair.macs[i]));
+        }
     }
-    (void)StringCchPrintfW(text, ARRAYSIZE(text), L"Pairing didn't complete.%ls%ls",
-                           (detail != NULL && detail[0] != 0) ? L" " : L"",
-                           detail != NULL ? detail : L"");
-    set_status(dlg, text);
-    update_controls(dlg);
+}
+
+static void disc_begin(void)
+{
+    g_pair.want_discovery = TRUE;
+    if (g_pair.discovery || !g_disc_available || g_quitting)
+        return;
+    if (!discovery_start(g_hwnd, WM_KB_DISC, NULL))
+        return;
+    g_pair.discovery = TRUE;
+    g_pair.empty = FALSE;
+    SetTimer(g_hwnd, KB_TIMER_DISC_EMPTY, KB_DISC_EMPTY_MS, NULL);
+}
+
+/* Stop browsing, unless a Mac is being looked up before pairing. */
+static void disc_end(void)
+{
+    g_pair.want_discovery = FALSE;
+    if (g_pair.waiting_entry >= 0)
+        return;
+    disc_stop_now();
+}
+
+/* Back to idle with a message. detail NULL: no message (the user cancelled). */
+static void pair_failed(const wchar_t *detail)
+{
+    if (g_pair.waiting_entry >= 0) {
+        KillTimer(g_hwnd, KB_TIMER_RESOLVE);
+        g_pair.waiting_entry = -1;
+    }
+    g_pair.state = FLY_PAIR_IDLE;
+    g_pair.target = -1;
+    if (detail != NULL)
+        notice_set(FLY_SEV_CRITICAL, L"Pairing didn\x2019t complete", detail[0] != 0 ? detail : L"Try again.");
+    if (!g_pair.want_discovery)
+        disc_stop_now();
+    ui_sync();
 }
 
 /* Drop the UI's interest in the current pairing attempt (cancels it). */
 static void pair_abandon(void)
 {
-    pair_job *j = g_su.job;
+    pair_job *j = g_pair.job;
     if (j == NULL)
         return;
-    g_su.job = NULL;
-    g_su.sas_shown = FALSE;
+    g_pair.job = NULL;
+    g_pair.sas_shown = FALSE;
     SetEvent(j->stop);
     job_release(j);
 }
 
-static void pair_start(HWND dlg, const wchar_t *address, const wchar_t *target)
+static void pair_start(const wchar_t *address, const wchar_t *target_label, int target)
 {
-    wchar_t text[KB_HOST_MAX + 64];
     pair_job *j;
     HANDLE th;
 
     j = (pair_job *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*j));
     if (j == NULL) {
-        pair_failed(dlg, L"KeyBridge ran out of memory.");
+        pair_failed(L"KeyBridge ran out of memory.");
         return;
     }
     if (!kb_parse_address(address, j->host, ARRAYSIZE(j->host), j->port, ARRAYSIZE(j->port),
                           KBP2_PORT_DEFAULT) ||
-        FAILED(StringCchCopyW(g_su.address, ARRAYSIZE(g_su.address), address))) {
+        FAILED(StringCchCopyW(g_pair.address, ARRAYSIZE(g_pair.address), address))) {
         HeapFree(GetProcessHeap(), 0, j);
-        pair_failed(dlg, L"That address doesn't look right.");
+        pair_failed(L"That address doesn\x2019t look right.");
         return;
     }
     j->stop = CreateEventW(NULL, TRUE, FALSE, NULL);
     j->confirm = CreateEventW(NULL, TRUE, FALSE, NULL);
     kb_pc_name(j->pc_name);
-    j->notify = dlg;
+    j->notify = g_hwnd;
     j->gen = ++g_pair_gen;
     j->refs = 2; /* the UI's and the thread's */
     th = (j->stop != NULL && j->confirm != NULL) ? CreateThread(NULL, 0, pair_thread, j, 0, NULL) : NULL;
     if (th == NULL) {
         j->refs = 1;
         job_release(j);
-        pair_failed(dlg, L"KeyBridge couldn't start pairing.");
+        pair_failed(L"KeyBridge couldn\x2019t start pairing.");
         return;
     }
     CloseHandle(th); /* the reference count, not a join, ends the job */
 
-    g_su.job = j;
-    g_su.job_gen = j->gen;
-    g_su.sas_shown = FALSE;
-    (void)StringCchCopyW(g_su.target, ARRAYSIZE(g_su.target), target);
-    (void)StringCchPrintfW(text, ARRAYSIZE(text), L"Connecting to %ls\x2026", target);
-    set_status(dlg, text);
-    update_controls(dlg);
+    g_pair.job = j;
+    g_pair.job_gen = j->gen;
+    g_pair.sas_shown = FALSE;
+    g_pair.state = FLY_PAIR_BUSY;
+    g_pair.target = target;
+    (void)StringCchCopyW(g_pair.target_label, ARRAYSIZE(g_pair.target_label), target_label);
+    notice_clear();
+    ui_sync();
 }
 
-static void pair_with_entry(HWND dlg, int i)
+static void pair_with_entry(int i)
 {
-    wchar_t address[ARRAYSIZE(g_su.address)];
-    if (!entry_address(&g_su.macs[i], address, ARRAYSIZE(address))) {
-        pair_failed(dlg, L"That Mac's address is too long.");
+    wchar_t address[ARRAYSIZE(g_pair.address)];
+    if (!entry_address(&g_pair.macs[i], address, ARRAYSIZE(address))) {
+        pair_failed(L"That Mac\x2019s address is too long.");
         return;
     }
-    pair_start(dlg, address, g_su.macs[i].label);
+    pair_start(address, g_pair.macs[i].label, i);
 }
 
-/* The Pair button (or a double-click in the list). */
-static void do_pair(HWND dlg)
+/* A Mac in the list was clicked. */
+static void pair_with_index(int i)
 {
-    wchar_t raw[KB_HOST_MAX + 16];
+    if (pair_busy() || i < 0 || i >= KB_MAX_MACS || !g_pair.macs[i].used)
+        return;
+    notice_clear();
+    if (g_pair.macs[i].resolved) {
+        pair_with_entry(i);
+        return;
+    }
+    /* Not looked up yet: resolve first, then pair. */
+    if (!discovery_resolve(g_pair.macs[i].instance)) {
+        pair_failed(L"KeyBridge couldn\x2019t look up that Mac. Try again, or enter its address manually.");
+        return;
+    }
+    g_pair.waiting_entry = i;
+    g_pair.state = FLY_PAIR_BUSY;
+    g_pair.target = i;
+    SetTimer(g_hwnd, KB_TIMER_RESOLVE, KB_RESOLVE_WAIT_MS, NULL);
+    ui_sync();
+}
+
+/* Pair with a typed address. */
+static void pair_with_address(const wchar_t *raw)
+{
     wchar_t addr[KB_HOST_MAX + 16];
     wchar_t host[KB_HOST_MAX + 1];
     wchar_t port[KB_PORT_MAX + 1];
-    wchar_t text[KB_NAME_MAX + 64];
     size_t len;
-    int i;
 
-    if (setup_busy())
+    if (pair_busy() || raw == NULL)
         return;
-    set_status(dlg, L"");
-
-    i = selected_entry(dlg);
-    if (i >= 0) {
-        if (g_su.macs[i].resolved) {
-            pair_with_entry(dlg, i);
-            return;
-        }
-        /* Not looked up yet: resolve first, then pair. */
-        if (!discovery_resolve(g_su.macs[i].instance)) {
-            pair_failed(dlg, L"KeyBridge couldn't look up that Mac. Try again, or enter its "
-                             L"address below.");
-            return;
-        }
-        g_su.waiting_entry = i;
-        SetTimer(dlg, KB_TIMER_RESOLVE, KB_RESOLVE_WAIT_MS, NULL);
-        (void)StringCchPrintfW(text, ARRAYSIZE(text), L"Looking up %ls\x2026", g_su.macs[i].label);
-        set_status(dlg, text);
-        update_controls(dlg);
-        return;
-    }
-
-    GetDlgItemTextW(dlg, IDC_HOST, raw, (int)ARRAYSIZE(raw));
     len = kb_trim_copy(raw, addr, ARRAYSIZE(addr));
     if (len == 0 || len == (size_t)-1 ||
         !kb_parse_address(addr, host, ARRAYSIZE(host), port, ARRAYSIZE(port), KBP2_PORT_DEFAULT)) {
-        MessageBoxW(dlg,
-                    L"That address doesn't look right. Use your Mac's name or IP address, for "
-                    L"example Camerons-MacBook.local or 192.168.1.20.",
-                    KB_APP_NAME, MB_OK | MB_ICONWARNING);
-        SetFocus(GetDlgItem(dlg, IDC_HOST));
-        SendDlgItemMessageW(dlg, IDC_HOST, EM_SETSEL, 0, -1);
+        notice_set(FLY_SEV_CRITICAL, L"That address doesn\x2019t look right",
+                   L"Use your Mac\x2019s name or IP address, for example Camerons-MacBook.local or "
+                   L"192.168.1.20.");
+        ui_sync();
         return;
     }
-    pair_start(dlg, addr, host);
+    pair_start(addr, host, -1);
 }
 
 /* Pairing finished (any outcome). */
-static void pair_finish(HWND dlg)
+static void pair_finish(void)
 {
-    pair_job *j = g_su.job;
+    pair_job *j = g_pair.job;
     kbp2_status st = j->status;
-    BOOL sas_shown = g_su.sas_shown;
+    BOOL sas_shown = g_pair.sas_shown;
     const wchar_t *detail = L"";
     wchar_t buf[256];
 
@@ -886,32 +715,46 @@ static void pair_finish(HWND dlg)
         BOOL saved, started;
 
         memset(&cfg, 0, sizeof(cfg));
-        (void)StringCchCopyW(cfg.host, ARRAYSIZE(cfg.host), g_su.address);
+        (void)StringCchCopyW(cfg.host, ARRAYSIZE(cfg.host), g_pair.address);
         (void)StringCchCopyW(cfg.mac_name, ARRAYSIZE(cfg.mac_name), j->mac_name);
         memcpy(cfg.ltk, j->ltk, KB_LTK_LEN);
+        if (j->mac_name[0] != 0)
+            (void)StringCchCopyW(g_pair.name, ARRAYSIZE(g_pair.name), j->mac_name);
         pair_abandon(); /* done with the job (it is wiped when freed) */
 
         saved = config_save(&cfg);
         if (!saved) {
             config_wipe(&cfg);
-            pair_failed(dlg, L"KeyBridge couldn't save the pairing on this PC.");
+            pair_failed(L"KeyBridge couldn\x2019t save the pairing on this PC.");
             return;
         }
-        if (!autostart_set(IsDlgButtonChecked(dlg, IDC_AUTOSTART) == BST_CHECKED))
-            MessageBoxW(dlg, L"KeyBridge couldn't change the \"Start when I sign in\" setting.",
-                        KB_APP_NAME, MB_OK | MB_ICONWARNING);
+        if (g_first_run) {
+            /* The first pairing ever: the installer's choice (or on). */
+            g_first_run = FALSE;
+            if (!autostart_set(autostart_default()))
+                notice_set(FLY_SEV_CAUTION, L"Couldn\x2019t change that setting",
+                           L"KeyBridge couldn\x2019t turn on \x201CStart with Windows\x201D.");
+            g_pref_autostart = autostart_is_enabled();
+        }
 
         g_skip_connected_balloon = TRUE;
         started = start_session(&cfg); /* replaces any previous session */
         config_wipe(&cfg);
         if (!started) {
             g_skip_connected_balloon = FALSE;
-            MessageBoxW(dlg, L"KeyBridge paired with your Mac but couldn't start connecting.",
-                        KB_APP_NAME, MB_OK | MB_ICONERROR);
+            notice_set(FLY_SEV_CRITICAL, L"Couldn\x2019t connect",
+                       L"KeyBridge paired with your Mac but couldn\x2019t start connecting.");
         }
-        (void)StringCchPrintfW(title, ARRAYSIZE(title), L"Paired with %ls", mac_label());
-        tray_balloon(title, L"Switch your Mac to Windows mode to type on this PC.", FALSE);
-        EndDialog(dlg, IDOK);
+        g_pair.state = FLY_PAIR_SUCCESS;
+        g_pair.target = -1;
+        SetTimer(g_hwnd, KB_TIMER_PAIR_OK, KB_PAIR_OK_MS, NULL);
+        if (!g_pair.want_discovery)
+            disc_stop_now();
+        if (!flyout_visible()) {
+            (void)StringCchPrintfW(title, ARRAYSIZE(title), L"Paired with %ls", mac_label());
+            tray_balloon(title, L"Switch your Mac to Windows mode to type on this PC.", FALSE);
+        }
+        ui_sync();
         return;
     }
 
@@ -919,16 +762,18 @@ static void pair_finish(HWND dlg)
     if (!sas_shown) {
         switch (st) {
         case KBP2_ERR_RESOLVE:
-            (void)StringCchPrintfW(buf, ARRAYSIZE(buf), L"Can't find %ls on the network.", g_su.target);
+            (void)StringCchPrintfW(buf, ARRAYSIZE(buf), L"Can\x2019t find %ls on the network.",
+                                   g_pair.target_label);
             detail = buf;
             break;
         case KBP2_ERR_CONNECT:
             (void)StringCchPrintfW(buf, ARRAYSIZE(buf),
-                                   L"Couldn't connect to %ls. Make sure KeyBridge is running on your Mac.",
-                                   g_su.target);
+                                   L"Couldn\x2019t connect to %ls. Make sure KeyBridge is running on your Mac.",
+                                   g_pair.target_label);
             detail = buf;
             break;
         case KBP2_STOPPED:
+            detail = NULL;
             break;
         default:
             detail = L"On your Mac, click the KeyBridge menu bar icon \x2192 Pair a Windows PC\x2026, "
@@ -941,336 +786,106 @@ static void pair_finish(HWND dlg)
             detail = L"It took too long. Try again.";
             break;
         case KBP2_ERR_AUTH:
-            detail = L"Your Mac's confirmation didn't match. Try again.";
+            detail = L"Your Mac\x2019s confirmation didn\x2019t match. Try again.";
             break;
         case KBP2_ERR_CLOSED:
         case KBP2_ERR_IO:
             detail = L"Your Mac cancelled, or the connection was lost.";
             break;
+        case KBP2_STOPPED:
+            detail = NULL;
+            break;
         default:
             break;
         }
     }
-    pair_failed(dlg, detail);
+    pair_failed(detail);
 }
 
-static void on_disc_events(HWND dlg)
+static void on_pair_event(WPARAM gen, LPARAM ev)
+{
+    if (g_pair.job == NULL || gen != g_pair.job_gen)
+        return; /* from an attempt that was already abandoned */
+
+    if (ev == KB_PAIR_EV_SAS) {
+        POINT anchor;
+        if (g_pair.sas_shown)
+            return;
+        g_pair.sas_shown = TRUE;
+        g_pair.state = FLY_PAIR_COMPARE;
+        g_pair.sas = g_pair.job->sas;
+        (void)StringCchCopyW(g_pair.name, ARRAYSIZE(g_pair.name),
+                             g_pair.job->mac_name[0] != 0 ? g_pair.job->mac_name : g_pair.target_label);
+        ui_sync();
+        if (!flyout_visible()) {
+            anchor.x = -1;
+            anchor.y = -1;
+            (void)flyout_show(anchor, FLY_PAGE_HOME, FLY_SHOW_PROGRAMMATIC);
+        }
+    } else if (ev == KB_PAIR_EV_DONE) {
+        pair_finish();
+    }
+}
+
+static void on_disc_events(void)
 {
     kb_disc_event *ev;
     int i;
 
-    /* A kb_disc_event is ~1 KB; keep it off the dialog's stack. */
+    /* A kb_disc_event is ~1 KB; keep it off the stack. */
     ev = (kb_disc_event *)HeapAlloc(GetProcessHeap(), 0, sizeof(*ev));
     if (ev == NULL)
         return;
     while (discovery_next(ev)) {
-        if (!g_su.discovery)
+        if (!g_pair.discovery)
             continue;
         switch (ev->kind) {
         case KB_DISC_ADDED:
-            i = entry_add(dlg, ev->instance);
-            if (i >= 0 && !g_su.macs[i].resolved)
-                (void)discovery_resolve(ev->instance); /* eagerly, so Pair is instant */
+            i = entry_add(ev->instance);
+            if (i >= 0 && !g_pair.macs[i].resolved)
+                (void)discovery_resolve(ev->instance); /* eagerly, so pairing is instant */
             break;
         case KB_DISC_REMOVED:
             i = entry_find(ev->instance);
             if (i >= 0) {
-                if (i == g_su.waiting_entry)
-                    pair_failed(dlg, L"That Mac is no longer on the network.");
-                entry_remove(dlg, i);
+                if (i == g_pair.waiting_entry)
+                    pair_failed(L"That Mac is no longer on the network.");
+                if (!(g_pair.state == FLY_PAIR_BUSY && g_pair.target == i))
+                    memset(&g_pair.macs[i], 0, sizeof(g_pair.macs[i]));
             }
             break;
         case KB_DISC_RESOLVED:
-            i = entry_add(dlg, ev->instance);
+            i = entry_add(ev->instance);
             if (i >= 0 && ev->host[0] != 0) {
-                (void)StringCchCopyW(g_su.macs[i].host, ARRAYSIZE(g_su.macs[i].host), ev->host);
-                g_su.macs[i].port = ev->port;
-                g_su.macs[i].resolved = TRUE;
-                if (i == g_su.waiting_entry) {
-                    KillTimer(dlg, KB_TIMER_RESOLVE);
-                    g_su.waiting_entry = -1;
-                    pair_with_entry(dlg, i);
+                (void)StringCchCopyW(g_pair.macs[i].host, ARRAYSIZE(g_pair.macs[i].host), ev->host);
+                g_pair.macs[i].port = ev->port;
+                g_pair.macs[i].resolved = TRUE;
+                if (i == g_pair.waiting_entry) {
+                    KillTimer(g_hwnd, KB_TIMER_RESOLVE);
+                    g_pair.waiting_entry = -1;
+                    pair_with_entry(i);
                 }
             }
             break;
         case KB_DISC_RESOLVE_FAILED:
             i = entry_find(ev->instance);
-            if (i >= 0 && i == g_su.waiting_entry)
-                pair_failed(dlg, L"KeyBridge couldn't look up that Mac. Try again, or enter its "
-                                 L"address below.");
+            if (i >= 0 && i == g_pair.waiting_entry)
+                pair_failed(L"KeyBridge couldn\x2019t look up that Mac. Try again, or enter its address "
+                            L"manually.");
             break;
         default:
             break;
         }
     }
     HeapFree(GetProcessHeap(), 0, ev);
-    update_controls(dlg);
-}
-
-static void move_control_up(HWND dlg, int id, int dy)
-{
-    HWND c = GetDlgItem(dlg, id);
-    RECT r;
-    if (c == NULL || !GetWindowRect(c, &r))
-        return;
-    MapWindowPoints(NULL, dlg, (POINT *)&r, 2);
-    SetWindowPos(c, NULL, r.left, r.top - dy, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-}
-
-/* No DNS-SD on this Windows: hide the list and close the gap. */
-static void hide_discovery(HWND dlg)
-{
-    static const int below[] = { IDC_MANUAL_LABEL, IDC_HOST, IDC_HOST_HINT, IDC_AUTOSTART,
-                                 IDC_SETUP_STATUS, IDOK, IDCANCEL };
-    RECT a, b, w;
-    int dy = 0;
-    size_t k;
-
-    if (GetWindowRect(GetDlgItem(dlg, IDC_LIST_LABEL), &a) &&
-        GetWindowRect(GetDlgItem(dlg, IDC_MANUAL_LABEL), &b))
-        dy = b.top - a.top;
-    ShowWindow(GetDlgItem(dlg, IDC_LIST_LABEL), SW_HIDE);
-    ShowWindow(GetDlgItem(dlg, IDC_MAC_LIST), SW_HIDE);
-    SetDlgItemTextW(dlg, IDC_MANUAL_LABEL, L"&Enter your Mac's address:");
-    if (dy > 0) {
-        for (k = 0; k < ARRAYSIZE(below); k++)
-            move_control_up(dlg, below[k], dy);
-        if (GetWindowRect(dlg, &w))
-            SetWindowPos(dlg, NULL, 0, 0, w.right - w.left, w.bottom - w.top - dy,
-                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-    }
-}
-
-static void setup_init(HWND dlg, BOOL first_run)
-{
-    BOOL autostart;
-
-    memset(&g_su, 0, sizeof(g_su));
-    g_su.waiting_entry = -1;
-    set_dialog_icons(dlg);
-    ui_init(&g_ui_setup, dlg);
-    SendDlgItemMessageW(dlg, IDC_HOST, EM_LIMITTEXT, KB_HOST_MAX, 0);
-
-    autostart = first_run ? autostart_default() : autostart_is_enabled();
-    CheckDlgButton(dlg, IDC_AUTOSTART, autostart ? BST_CHECKED : BST_UNCHECKED);
-
-    g_su.discovery = discovery_available() && discovery_start(dlg, WM_KB_DISC, NULL);
-    if (g_su.discovery)
-        update_placeholder(dlg);
-    else
-        hide_discovery(dlg);
-
-    if (g_paired && g_status == KB_ST_NOT_PAIRED)
-        set_status(dlg, L"Your Mac no longer recognizes this PC. Pair again.");
-    update_controls(dlg);
-    SetForegroundWindow(dlg);
-}
-
-/* ------------------------------------------------------------------------ */
-/* Compare dialog (modal, owned by the setup dialog)                        */
-/* ------------------------------------------------------------------------ */
-
-static void compare_init(HWND dlg)
-{
-    wchar_t title[KB_NAME_MAX + 32];
-    wchar_t number[KB_SAS_DISPLAY_LEN + 1];
-    pair_job *j = g_su.job;
-
-    g_compare = dlg;
-    set_dialog_icons(dlg);
-    ui_init(&g_ui_compare, dlg); /* the number is owner-drawn in a large font */
-
-    if (j->mac_name[0] != 0)
-        (void)StringCchPrintfW(title, ARRAYSIZE(title), L"Pair with %ls?", j->mac_name);
-    else
-        (void)StringCchCopyW(title, ARRAYSIZE(title), L"Pair with this Mac?");
-    SetDlgItemTextW(dlg, IDC_CMP_TITLE, title);
-    kb_format_sas(j->sas, number);
-    SetDlgItemTextW(dlg, IDC_CMP_NUMBER, number);
-    SetDlgItemTextW(dlg, IDC_CMP_STATUS, L"");
-
-    SetFocus(GetDlgItem(dlg, IDCANCEL));
-    SetForegroundWindow(dlg);
-}
-
-static INT_PTR CALLBACK compare_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
-{
-    INT_PTR handled;
-
-    if (msg != WM_INITDIALOG && ui_dialog_message(&g_ui_compare, dlg, msg, wp, lp, &handled))
-        return handled;
-    switch (msg) {
-    case WM_INITDIALOG:
-        compare_init(dlg);
-        return FALSE; /* focus was set explicitly */
-    case WM_COMMAND:
-        switch (LOWORD(wp)) {
-        case IDC_CMP_CONFIRM:
-            if (g_su.job != NULL) {
-                SetEvent(g_su.job->confirm); /* the pairing thread sends PcConfirm */
-                EnableWindow(GetDlgItem(dlg, IDC_CMP_CONFIRM), FALSE);
-                SetDlgItemTextW(dlg, IDC_CMP_STATUS, L"Waiting for your Mac\x2026");
-                SetFocus(GetDlgItem(dlg, IDCANCEL));
-            }
-            return TRUE;
-        case IDCANCEL:
-            EndDialog(dlg, IDCANCEL);
-            return TRUE;
-        case IDOK:
-            return TRUE; /* Enter with no button focused: deliberately nothing */
-        default:
-            break;
-        }
-        break;
-    case WM_DESTROY:
-        if (g_compare == dlg)
-            g_compare = NULL;
-        ui_free(&g_ui_compare);
-        break;
-    default:
-        break;
-    }
-    return FALSE;
-}
-
-static void on_pair_event(HWND dlg, WPARAM gen, LPARAM ev)
-{
-    INT_PTR r;
-
-    if (g_su.job == NULL || gen != g_su.job_gen)
-        return; /* from an attempt that was already abandoned */
-
-    if (ev == KB_PAIR_EV_SAS) {
-        if (g_compare != NULL || g_su.sas_shown)
-            return;
-        g_su.sas_shown = TRUE;
-        set_status(dlg, L"Compare the numbers on both screens.");
-        /* Nested modal loop. If the result arrives meanwhile, the DONE handler
-         * below closes this dialog with IDABORT and handles the result. */
-        r = DialogBoxParamW(g_inst, MAKEINTRESOURCEW(IDD_COMPARE), dlg, compare_proc, 0);
-        if (r != IDABORT && g_su.job != NULL && g_su.job_gen == gen) {
-            pair_abandon(); /* Cancel (or the dialog failed): the thread closes the connection */
-            pair_failed(dlg, L"");
-        }
-    } else if (ev == KB_PAIR_EV_DONE) {
-        if (g_compare != NULL)
-            EndDialog(g_compare, IDABORT);
-        pair_finish(dlg);
-    }
-}
-
-static INT_PTR CALLBACK setup_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
-{
-    INT_PTR handled;
-
-    if (msg != WM_INITDIALOG && ui_dialog_message(&g_ui_setup, dlg, msg, wp, lp, &handled))
-        return handled;
-    switch (msg) {
-    case WM_INITDIALOG:
-        g_setup = dlg;
-        setup_init(dlg, lp != 0);
-        return TRUE;
-
-    case WM_COMMAND:
-        switch (LOWORD(wp)) {
-        case IDC_MAC_LIST:
-            if (HIWORD(wp) == LBN_SELCHANGE) {
-                HWND list = GetDlgItem(dlg, IDC_MAC_LIST);
-                LRESULT sel = SendMessageW(list, LB_GETCURSEL, 0, 0);
-                if (sel != LB_ERR && SendMessageW(list, LB_GETITEMDATA, (WPARAM)sel, 0) == KB_PLACEHOLDER)
-                    SendMessageW(list, LB_SETCURSEL, (WPARAM)-1, 0);
-                else if (sel != LB_ERR)
-                    SetDlgItemTextW(dlg, IDC_HOST, L""); /* one choice at a time */
-                update_controls(dlg);
-            } else if (HIWORD(wp) == LBN_DBLCLK) {
-                if (selected_entry(dlg) >= 0)
-                    do_pair(dlg);
-            }
-            return TRUE;
-        case IDC_HOST:
-            if (HIWORD(wp) == EN_CHANGE) {
-                if (GetWindowTextLengthW(GetDlgItem(dlg, IDC_HOST)) > 0 && g_su.discovery)
-                    SendDlgItemMessageW(dlg, IDC_MAC_LIST, LB_SETCURSEL, (WPARAM)-1, 0);
-                update_controls(dlg);
-            }
-            return TRUE;
-        case IDOK:
-            if (IsWindowEnabled(GetDlgItem(dlg, IDOK)))
-                do_pair(dlg);
-            return TRUE;
-        case IDCANCEL:
-            if (setup_busy()) {
-                /* First Cancel stops the attempt; the next one closes. */
-                pair_abandon();
-                pair_failed(dlg, L"");
-            } else {
-                EndDialog(dlg, IDCANCEL);
-            }
-            return TRUE;
-        default:
-            break;
-        }
-        break;
-
-    case WM_CLOSE:
-        EndDialog(dlg, IDCANCEL); /* the title-bar X always closes */
-        return TRUE;
-
-    case WM_KB_DISC:
-        on_disc_events(dlg);
-        return TRUE;
-
-    case WM_KB_PAIR:
-        on_pair_event(dlg, wp, lp);
-        return TRUE;
-
-    case WM_TIMER:
-        if (wp == KB_TIMER_RESOLVE && g_su.waiting_entry >= 0)
-            pair_failed(dlg, L"KeyBridge couldn't look up that Mac. Try again, or enter its "
-                             L"address below.");
-        return TRUE;
-
-    case WM_DESTROY:
-        KillTimer(dlg, KB_TIMER_RESOLVE);
-        discovery_stop();
-        pair_abandon();
-        g_su.waiting_entry = -1;
-        if (g_setup == dlg)
-            g_setup = NULL;
-        ui_free(&g_ui_setup);
-        break;
-
-    default:
-        break;
-    }
-    return FALSE;
-}
-
-static INT_PTR show_setup(BOOL first_run)
-{
-    INT_PTR r;
-    HWND owner;
-
-    if (g_setup != NULL) {
-        HWND front = g_compare != NULL ? g_compare : g_setup;
-        ShowWindow(g_setup, SW_SHOWNORMAL);
-        SetForegroundWindow(front);
-        return IDCANCEL;
-    }
-    if (g_quitting)
-        return IDCANCEL;
-    owner = modal_begin(); /* Settings, if it is open */
-    r = DialogBoxParamW(g_inst, MAKEINTRESOURCEW(IDD_SETUP), owner, setup_proc, (LPARAM)first_run);
-    modal_end(owner);
-    settings_refresh();
-    return r;
+    if (!g_pair.want_discovery && g_pair.waiting_entry < 0)
+        disc_stop_now();
+    ui_sync();
 }
 
 /* ------------------------------------------------------------------------ */
 /* Updates (docs/UPDATES.md; networking and verification are in update.c)   */
 /* ------------------------------------------------------------------------ */
-
-#define KB_PROGRESS_RANGE 1000
 
 static ULONGLONG unix_now(void)
 {
@@ -1302,9 +917,10 @@ static void open_notes(const kb_update_manifest *m)
     if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, m->notes_url, -1, url,
                             (int)ARRAYSIZE(url)) <= 0)
         return;
-    if ((INT_PTR)ShellExecuteW(NULL, L"open", url, NULL, NULL, SW_SHOWNORMAL) <= 32)
-        MessageBoxW(NULL, L"KeyBridge couldn't open your web browser.", KB_APP_NAME,
-                    MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+    if ((INT_PTR)ShellExecuteW(NULL, L"open", url, NULL, NULL, SW_SHOWNORMAL) <= 32) {
+        notice_set(FLY_SEV_CRITICAL, L"Couldn\x2019t open your web browser", NULL);
+        ui_sync();
+    }
 }
 
 static void pending_clear(void)
@@ -1313,14 +929,17 @@ static void pending_clear(void)
         HeapFree(GetProcessHeap(), 0, g_upd_pending);
         g_upd_pending = NULL;
     }
+    g_upd_offer = FALSE;
 }
 
 static void pending_set(const kb_update_manifest *m)
 {
     if (g_upd_pending == NULL)
         g_upd_pending = (kb_update_manifest *)HeapAlloc(GetProcessHeap(), 0, sizeof(*g_upd_pending));
-    if (g_upd_pending != NULL)
+    if (g_upd_pending != NULL) {
         *g_upd_pending = *m;
+        g_upd_offer = TRUE;
+    }
 }
 
 /* The detail under "Couldn't check for updates" / "Couldn't download the update". */
@@ -1352,284 +971,172 @@ static void update_error_text(kb_upd_result r, DWORD detail, wchar_t *buf, size_
     }
 }
 
-static HRESULT CALLBACK prompt_cb(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LONG_PTR data)
+static void update_fail(const wchar_t *text)
 {
-    const kb_update_manifest *m = (const kb_update_manifest *)data;
-
-    UNREFERENCED_PARAMETER(wp);
-    UNREFERENCED_PARAMETER(lp);
-    switch (msg) {
-    case TDN_CREATED:
-        g_upd_dialog = hwnd;
-        set_dialog_icons(hwnd);
-        ui_title_bar(hwnd, FALSE);
-        SetForegroundWindow(hwnd);
-        break;
-    case TDN_HYPERLINK_CLICKED:
-        open_notes(m);
-        break;
-    case TDN_DESTROYED:
-        if (g_upd_dialog == hwnd)
-            g_upd_dialog = NULL;
-        break;
-    default:
-        break;
-    }
-    return S_OK;
+    g_upd_failed = TRUE;
+    (void)StringCchCopyW(g_upd_error, ARRAYSIZE(g_upd_error), text);
 }
 
-/* "KeyBridge <new> is available". Returns a KB_TD_* id. */
-static int show_update_prompt(HWND owner, const kb_update_manifest *m, BOOL installed)
+/* "Checked today at 9:41 AM" (or the date) under the automatic-check toggle. */
+static void update_status_text(wchar_t *buf, size_t cap)
 {
-    TASKDIALOGCONFIG tdc;
-    TASKDIALOG_BUTTON buttons[3];
-    wchar_t ver[KB_UPD_VERSION_MAX + 1];
-    wchar_t title[160];
-    int button = KB_TD_LATER;
+    ULONGLONG last;
+    ULARGE_INTEGER u;
+    FILETIME ft;
+    SYSTEMTIME utc, loc, now;
+    wchar_t t[48];
 
-    version_w(m->version, ver, ARRAYSIZE(ver));
-    memset(&tdc, 0, sizeof(tdc));
-    tdc.cbSize = (UINT)sizeof(tdc);
-    tdc.hwndParent = owner;
-    tdc.hInstance = g_inst;
-    tdc.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_ENABLE_HYPERLINKS |
-                  (owner != NULL ? TDF_POSITION_RELATIVE_TO_WINDOW : 0);
-    tdc.pszWindowTitle = KB_APP_NAME;
-    if (g_icon_app_large != NULL) {
-        tdc.dwFlags |= TDF_USE_HICON_MAIN;
-        tdc.hMainIcon = g_icon_app_large;
+    if (g_upd_note[0] != 0) {
+        (void)StringCchCopyW(buf, cap, g_upd_note);
+        return;
     }
-    buttons[0].nButtonID = installed ? KB_TD_INSTALL : KB_TD_DOWNLOAD;
-    buttons[0].pszButtonText = installed ? L"Install Update" : L"Download";
-    buttons[1].nButtonID = KB_TD_LATER;
-    buttons[1].pszButtonText = L"Later";
-    buttons[2].nButtonID = KB_TD_SKIP;
-    buttons[2].pszButtonText = L"Skip This Version";
-    (void)StringCchPrintfW(title, ARRAYSIZE(title), L"KeyBridge %ls is available", ver);
-    if (installed) {
-        tdc.pszContent = L"You have version " KB_VERSION_W L". <a href=\"notes\">What\x2019s new</a>";
+    if (g_upd_pending != NULL) {
+        wchar_t ver[KB_UPD_VERSION_MAX + 1];
+        version_w(g_upd_pending->version, ver, ARRAYSIZE(ver));
+        (void)StringCchPrintfW(buf, cap, L"KeyBridge %ls is available", ver);
+        return;
+    }
+    last = prefs_last_update_check();
+    (void)StringCchCopyW(buf, cap, L"Version " KB_VERSION_W);
+    if (last == 0 || last > 0x0FFFFFFFFFull)
+        return;
+    u.QuadPart = last * 10000000ull + 116444736000000000ull;
+    ft.dwLowDateTime = u.LowPart;
+    ft.dwHighDateTime = u.HighPart;
+    if (!FileTimeToSystemTime(&ft, &utc) || !SystemTimeToTzSpecificLocalTime(NULL, &utc, &loc))
+        return;
+    GetLocalTime(&now);
+    if (loc.wYear == now.wYear && loc.wMonth == now.wMonth && loc.wDay == now.wDay) {
+        if (GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, &loc, NULL, t, (int)ARRAYSIZE(t)) > 0)
+            (void)StringCchPrintfW(buf, cap, L"Checked today at %ls", t);
     } else {
-        /* A portable copy: the installer would not replace this exe. */
-        tdc.pszContent = L"You have version " KB_VERSION_W L". This copy of KeyBridge isn\x2019t running "
-                         L"from its install folder, so it can\x2019t update itself. Choose Download to "
-                         L"get the new version.";
+        if (GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_SHORTDATE, &loc, NULL, t, (int)ARRAYSIZE(t),
+                            NULL) > 0)
+            (void)StringCchPrintfW(buf, cap, L"Last checked %ls", t);
     }
-    tdc.pszMainInstruction = title;
-    tdc.cButtons = (UINT)ARRAYSIZE(buttons);
-    tdc.pButtons = buttons;
-    tdc.nDefaultButton = buttons[0].nButtonID; /* safe: it still asks nothing of the Mac */
-    tdc.pfCallback = prompt_cb;
-    tdc.lpCallbackData = (LONG_PTR)m;
-    if (FAILED(TaskDialogIndirect(&tdc, &button, NULL, NULL)))
-        return KB_TD_LATER;
-    return button; /* IDCANCEL (Esc or the X) means Later */
-}
-
-typedef struct {
-    kb_upd_job   *job;
-    BOOL          finished;  /* the download ended (any result) */
-    BOOL          launched;  /* the installer is running */
-    BOOL          marquee;   /* the size isn't known yet */
-    kb_upd_result result;
-    DWORD         launch_err;
-} dl_ctx;
-
-/* Progress dialog timer (about every 200 ms). */
-static void progress_poll(HWND hwnd, dl_ctx *c)
-{
-    ULONGLONG done = 0, total = 0;
-    kb_upd_result r = kb_upd_job_result(c->job);
-
-    kb_upd_job_progress(c->job, &done, &total);
-    if (total > 0) {
-        if (c->marquee) { /* the size is known now: show real progress */
-            c->marquee = FALSE;
-            SendMessageW(hwnd, TDM_SET_PROGRESS_BAR_MARQUEE, FALSE, 0);
-            SendMessageW(hwnd, TDM_SET_MARQUEE_PROGRESS_BAR, FALSE, 0);
-            SendMessageW(hwnd, TDM_SET_PROGRESS_BAR_RANGE, 0, MAKELPARAM(0, KB_PROGRESS_RANGE));
-        }
-        if (done > total)
-            done = total;
-        SendMessageW(hwnd, TDM_SET_PROGRESS_BAR_POS, (WPARAM)(done * KB_PROGRESS_RANGE / total), 0);
-    }
-    if (r == KB_UPD_RUNNING)
-        return;
-
-    c->finished = TRUE;
-    c->result = r;
-    if (r == KB_UPD_DOWNLOADED && !g_quitting) {
-        SendMessageW(hwnd, TDM_SET_ELEMENT_TEXT, TDE_MAIN_INSTRUCTION, (LPARAM)L"Installing\x2026");
-        UpdateWindow(hwnd);
-        c->launched = kb_upd_launch_installer(c->job, &c->launch_err);
-    }
-    PostMessageW(hwnd, TDM_CLICK_BUTTON, IDCANCEL, 0); /* close the dialog */
-}
-
-static HRESULT CALLBACK progress_cb(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LONG_PTR data)
-{
-    dl_ctx *c = (dl_ctx *)data;
-
-    UNREFERENCED_PARAMETER(wp);
-    UNREFERENCED_PARAMETER(lp);
-    switch (msg) {
-    case TDN_CREATED:
-        g_upd_dialog = hwnd;
-        set_dialog_icons(hwnd);
-        ui_title_bar(hwnd, FALSE);
-        /* An animated bar until the download's size is known. */
-        c->marquee = TRUE;
-        SendMessageW(hwnd, TDM_SET_MARQUEE_PROGRESS_BAR, TRUE, 0);
-        SendMessageW(hwnd, TDM_SET_PROGRESS_BAR_MARQUEE, TRUE, 30);
-        SetForegroundWindow(hwnd);
-        break;
-    case TDN_TIMER:
-        if (!c->finished)
-            progress_poll(hwnd, c);
-        break;
-    case TDN_DESTROYED:
-        if (g_upd_dialog == hwnd)
-            g_upd_dialog = NULL;
-        break;
-    default:
-        break; /* Cancel (the user's or ours) closes the dialog */
-    }
-    return S_OK;
-}
-
-/* Install Update: download and verify (update.c), run the installer, quit. */
-static void download_and_install(HWND owner, const kb_update_manifest *m)
-{
-    TASKDIALOGCONFIG tdc;
-    wchar_t ver[KB_UPD_VERSION_MAX + 1], content[64], text[256];
-    kb_upd_result r;
-    DWORD detail;
-    BOOL finished;
-    dl_ctx c;
-
-    memset(&c, 0, sizeof(c));
-    c.job = kb_upd_download_start(g_hwnd, WM_KB_UPDATE, m, KB_VER_STRING);
-    if (c.job == NULL) {
-        kb_notice(L"Couldn\x2019t download the update", L"Something went wrong on this PC.", TRUE);
-        return;
-    }
-
-    version_w(m->version, ver, ARRAYSIZE(ver));
-    (void)StringCchPrintfW(content, ARRAYSIZE(content), L"KeyBridge %ls", ver);
-    memset(&tdc, 0, sizeof(tdc));
-    tdc.cbSize = (UINT)sizeof(tdc);
-    tdc.hwndParent = owner;
-    tdc.hInstance = g_inst;
-    tdc.dwFlags = TDF_SHOW_PROGRESS_BAR | TDF_CALLBACK_TIMER | TDF_ALLOW_DIALOG_CANCELLATION |
-                  (owner != NULL ? TDF_POSITION_RELATIVE_TO_WINDOW : 0);
-    tdc.dwCommonButtons = TDCBF_CANCEL_BUTTON;
-    tdc.pszWindowTitle = KB_APP_NAME;
-    if (g_icon_app_large != NULL) {
-        tdc.dwFlags |= TDF_USE_HICON_MAIN;
-        tdc.hMainIcon = g_icon_app_large;
-    }
-    tdc.pszMainInstruction = L"Downloading update\x2026";
-    tdc.pszContent = content;
-    tdc.pfCallback = progress_cb;
-    tdc.lpCallbackData = (LONG_PTR)&c;
-    (void)TaskDialogIndirect(&tdc, NULL, NULL, NULL);
-
-    if (c.launched) {
-        /* The installer waits for KeyBridge to exit, replaces it and starts it
-         * again (/RELAUNCH). Quitting releases every held key first. */
-        kb_upd_job_release(c.job);
-        request_quit();
-        return;
-    }
-    finished = c.finished;
-    r = c.result;
-    detail = kb_upd_job_detail(c.job);
-    kb_upd_job_release(c.job); /* cancels a running download; deletes the file */
-    if (!finished || g_quitting || r == KB_UPD_ERR_CANCELLED)
-        return;
-
-    if (r == KB_UPD_DOWNLOADED) {
-        (void)StringCchPrintfW(text, ARRAYSIZE(text),
-                               L"KeyBridge couldn\x2019t start the installer (error %lu).", c.launch_err);
-        kb_notice(L"Couldn\x2019t install the update", text, TRUE);
-    } else if (r == KB_UPD_ERR_DAMAGED) {
-        kb_notice(L"Couldn\x2019t install the update",
-                  L"The update was damaged or tampered with, so KeyBridge didn\x2019t install it.", TRUE);
-    } else {
-        update_error_text(r, detail, text, ARRAYSIZE(text));
-        kb_notice(L"Couldn\x2019t download the update", text, TRUE);
-    }
-}
-
-/* Show the update prompt and do what the user picks. */
-static void update_offer(const kb_update_manifest *offer)
-{
-    kb_update_manifest m;
-    BOOL installed;
-    HWND owner;
-    int choice;
-
-    if (g_quitting)
-        return;
-    if (g_upd_ui) {
-        if (g_upd_dialog != NULL)
-            SetForegroundWindow(g_upd_dialog);
-        return;
-    }
-    m = *offer; /* offer may be g_upd_pending, which is freed below */
-    installed = kb_upd_is_installed_copy();
-    g_upd_ui = TRUE;
-    settings_refresh();
-    owner = modal_begin(); /* Settings, if it is open */
-    choice = show_update_prompt(owner, &m, installed);
-    if (!g_quitting) {
-        switch (choice) {
-        case KB_TD_INSTALL:
-            pending_clear();
-            if (g_upd_check != NULL) { /* a background check has nothing left to add */
-                kb_upd_job_release(g_upd_check);
-                g_upd_check = NULL;
-            }
-            download_and_install(owner, &m);
-            break;
-        case KB_TD_DOWNLOAD:
-            pending_clear();
-            open_notes(&m);
-            break;
-        case KB_TD_SKIP:
-            pending_clear();
-            if (!prefs_set_skipped_version(m.version))
-                kb_notice(L"Couldn\x2019t save that setting", NULL, TRUE);
-            break;
-        default:
-            break; /* Later: an automatic find stays in the menu */
-        }
-    }
-    modal_end(owner);
-    g_upd_ui = FALSE;
-    settings_refresh();
 }
 
 /* Manual checks report every outcome; automatic ones stay silent. Never two at once. */
 static void update_check_start(BOOL manual)
 {
-    if (g_quitting)
+    if (g_quitting || g_upd_download != NULL || g_upd_installing)
         return;
-    if (g_upd_ui) {
-        if (manual && g_upd_dialog != NULL)
-            SetForegroundWindow(g_upd_dialog);
-        return;
+    if (manual) {
+        g_upd_failed = FALSE;
+        g_upd_note[0] = 0;
     }
     if (g_upd_check != NULL) {
         if (manual)
             g_upd_check_manual = TRUE; /* an automatic check is running: report it */
-        settings_refresh();
+        ui_sync();
         return;
     }
     g_upd_check = kb_upd_check_start(g_hwnd, WM_KB_UPDATE, KB_VER_STRING);
     g_upd_check_manual = manual;
-    settings_refresh();
     if (g_upd_check == NULL && manual)
-        kb_notice(L"Couldn\x2019t check for updates", L"Something went wrong on this PC.", TRUE);
+        update_fail(L"KeyBridge couldn\x2019t check for updates. Something went wrong on this PC.");
+    ui_sync();
+}
+
+static void download_finished(kb_upd_result r)
+{
+    kb_upd_job *j = g_upd_download;
+    wchar_t text[256];
+    DWORD err = 0;
+
+    KillTimer(g_hwnd, KB_TIMER_UPD_PROGRESS);
+    if (j == NULL)
+        return;
+    if (r == KB_UPD_DOWNLOADED && !g_quitting) {
+        g_upd_installing = TRUE;
+        ui_sync();
+        if (kb_upd_launch_installer(j, &err)) {
+            /* The installer waits for KeyBridge to exit, replaces it and starts
+             * it again (/RELAUNCH). Quitting releases every held key first. */
+            g_upd_download = NULL;
+            kb_upd_job_release(j);
+            request_quit();
+            return;
+        }
+        g_upd_installing = FALSE;
+        (void)StringCchPrintfW(text, ARRAYSIZE(text), L"KeyBridge couldn\x2019t start the installer (error %lu).",
+                               err);
+        update_fail(text);
+    } else if (r == KB_UPD_ERR_DAMAGED) {
+        update_fail(L"The update was damaged or tampered with, so KeyBridge didn\x2019t install it.");
+    } else if (r != KB_UPD_ERR_CANCELLED && r != KB_UPD_DOWNLOADED) {
+        update_error_text(r, kb_upd_job_detail(j), text, ARRAYSIZE(text));
+        update_fail(text);
+    }
+    g_upd_download = NULL;
+    kb_upd_job_release(j); /* deletes the file */
+    ui_sync();
+}
+
+/* Install and restart: download and verify (update.c), run the installer, quit. */
+static void update_install(void)
+{
+    if (g_quitting || g_upd_download != NULL || g_upd_installing)
+        return;
+    if (g_upd_pending == NULL) {
+        update_check_start(TRUE);
+        return;
+    }
+    if (!kb_upd_is_installed_copy()) {
+        /* A portable copy: the installer would not replace this exe. */
+        open_notes(g_upd_pending);
+        return;
+    }
+    if (g_upd_check != NULL) { /* a background check has nothing left to add */
+        kb_upd_job_release(g_upd_check);
+        g_upd_check = NULL;
+    }
+    g_upd_failed = FALSE;
+    g_upd_download = kb_upd_download_start(g_hwnd, WM_KB_UPDATE, g_upd_pending, KB_VER_STRING);
+    if (g_upd_download == NULL) {
+        update_fail(L"Something went wrong on this PC.");
+    } else {
+        g_upd_permille = -1;
+        SetTimer(g_hwnd, KB_TIMER_UPD_PROGRESS, 200, NULL);
+    }
+    ui_sync();
+}
+
+static void update_progress(void)
+{
+    ULONGLONG done = 0, total = 0;
+    kb_upd_result r;
+    int pm = -1;
+
+    if (g_upd_download == NULL) {
+        KillTimer(g_hwnd, KB_TIMER_UPD_PROGRESS);
+        return;
+    }
+    kb_upd_job_progress(g_upd_download, &done, &total);
+    if (total > 0) {
+        if (done > total)
+            done = total;
+        pm = (int)(done * 1000u / total);
+    }
+    r = kb_upd_job_result(g_upd_download);
+    if (r != KB_UPD_RUNNING) {
+        download_finished(r);
+        return;
+    }
+    if (pm != g_upd_permille) {
+        g_upd_permille = pm;
+        ui_sync();
+    }
+}
+
+static void update_cancel(void)
+{
+    if (g_upd_download == NULL)
+        return;
+    KillTimer(g_hwnd, KB_TIMER_UPD_PROGRESS);
+    kb_upd_job_release(g_upd_download); /* cancels it; deletes the file */
+    g_upd_download = NULL;
+    ui_sync();
 }
 
 static void on_update_message(LPARAM id)
@@ -1641,8 +1148,14 @@ static void on_update_message(LPARAM id)
     kb_upd_result r;
     DWORD detail;
 
+    if (g_upd_download != NULL && (LPARAM)kb_upd_job_id(g_upd_download) == id) {
+        r = kb_upd_job_result(g_upd_download);
+        if (r != KB_UPD_RUNNING)
+            download_finished(r);
+        return;
+    }
     if (j == NULL || (LPARAM)kb_upd_job_id(j) != id)
-        return; /* a download, or a check that was abandoned */
+        return; /* a check that was abandoned */
     r = kb_upd_job_result(j);
     if (r == KB_UPD_RUNNING)
         return;
@@ -1660,42 +1173,41 @@ static void on_update_message(LPARAM id)
 
     if (r == KB_UPD_NEWER || r == KB_UPD_CURRENT)
         (void)prefs_set_last_update_check(unix_now());
-    settings_refresh(); /* "Checking for updates..." is over */
 
     switch (r) {
     case KB_UPD_NEWER:
         if (m == NULL)
             break;
         if (manual) {
-            pending_clear();
-            update_offer(m); /* a manual check offers even a skipped version */
+            pending_set(m); /* a manual check offers even a skipped version */
         } else if (!prefs_is_skipped_version(m->version)) {
             wchar_t ver[KB_UPD_VERSION_MAX + 1], title[64];
             version_w(m->version, ver, ARRAYSIZE(ver));
             (void)StringCchPrintfW(title, ARRAYSIZE(title), L"KeyBridge %ls is available", ver);
             pending_set(m);
-            settings_refresh();
-            /* No dialog out of nowhere: it would take the keyboard focus while
-             * someone may be typing. The user opens it from here or the menu. */
-            tray_balloon(title, L"Click here to see what\x2019s new and update.", FALSE);
-            g_balloon_update = TRUE;
+            /* No window out of nowhere: it would take the keyboard focus while
+             * someone may be typing. The flyout offers it when opened. */
+            if (!flyout_visible()) {
+                tray_balloon(title, L"Click here to see what\x2019s new and update.", FALSE);
+                g_balloon_update = TRUE;
+            }
         }
         break;
     case KB_UPD_CURRENT:
         pending_clear();
-        settings_refresh();
         if (manual)
-            kb_notice(L"You\x2019re up to date", L"You have KeyBridge " KB_VERSION_W L".", FALSE);
+            (void)StringCchCopyW(g_upd_note, ARRAYSIZE(g_upd_note), L"You\x2019re up to date");
         break;
     case KB_UPD_ERR_CANCELLED:
         break;
     default:
         if (manual) {
             update_error_text(r, detail, text, ARRAYSIZE(text));
-            kb_notice(L"Couldn\x2019t check for updates", text, TRUE);
+            update_fail(text);
         }
         break;
     }
+    ui_sync();
 done:
     if (m != NULL)
         HeapFree(GetProcessHeap(), 0, m);
@@ -1725,274 +1237,264 @@ static void on_update_timer(WPARAM id)
 }
 
 /* ------------------------------------------------------------------------ */
-/* Settings dialog (modeless)                                               */
+/* The flyout                                                               */
 /* ------------------------------------------------------------------------ */
 
-/* Color of the dot before the connection status (ui.h; not High Contrast). */
-static COLORREF ui_dot_color(void)
+static fly_conn fly_conn_of(void)
 {
     if (!g_paired)
-        return RGB(0x8A, 0x8A, 0x8A);
+        return FLY_CONN_UNPAIRED;
     switch (g_status) {
     case KB_ST_CONNECTED:
-        return RGB(0x0F, 0x7B, 0x0F); /* Windows 11 "success" green */
+        return FLY_CONN_CONNECTED;
+    case KB_ST_WAITING:
+        return FLY_CONN_WAITING;
     case KB_ST_NOT_FOUND:
+        return FLY_CONN_NOT_FOUND;
     case KB_ST_NOT_PAIRED:
-        return RGB(0xC4, 0x2B, 0x1C); /* "critical" red */
+        return FLY_CONN_NOT_PAIRED;
+    case KB_ST_NONE:
+    case KB_ST_CONNECTING:
     default:
-        return RGB(0x9D, 0x5D, 0x00); /* "caution" amber */
+        return FLY_CONN_CONNECTING;
     }
 }
 
-/* The connection status under the Mac's name. */
-static void settings_status_text(wchar_t *buf, size_t cap)
+/* Describe everything the flyout shows. */
+static void ui_sync(void)
 {
-    const wchar_t *s;
+    fly_state *s = &g_fs;
+    int order[KB_MAX_MACS], n = 0, i, k;
 
-    if (!g_paired) {
-        s = L"Pair with your Mac to type on this PC.";
-    } else {
-        switch (g_status) {
-        case KB_ST_CONNECTED:
-            s = L"Connected";
-            break;
-        case KB_ST_WAITING:
-            s = L"Waiting for this Mac\x2026";
-            break;
-        case KB_ST_NOT_FOUND:
-            s = L"Can\x2019t find it on the network";
-            break;
-        case KB_ST_NOT_PAIRED:
-            s = L"It no longer recognizes this PC \x2014 pair again";
-            break;
-        default:
-            s = L"Connecting\x2026";
-            break;
-        }
-    }
-    (void)StringCchCopyW(buf, cap, s);
-}
-
-/* Enable or disable a control without stranding the keyboard focus on it. */
-static void settings_enable(HWND dlg, int id, BOOL enable)
-{
-    HWND c = GetDlgItem(dlg, id);
-
-    if (c == NULL || (IsWindowEnabled(c) ? TRUE : FALSE) == (enable ? TRUE : FALSE))
+    if (!g_fly_ok || g_quitting)
         return;
-    if (!enable && GetFocus() == c)
-        SendMessageW(dlg, WM_NEXTDLGCTL, (WPARAM)GetDlgItem(dlg, IDCANCEL), TRUE);
-    EnableWindow(c, enable);
-}
+    memset(s, 0, sizeof(*s));
+    (void)StringCchCopyW(s->version, ARRAYSIZE(s->version), KB_VERSION_W);
+    s->conn = fly_conn_of();
+    if (g_paired)
+        (void)StringCchCopyW(s->mac_name, ARRAYSIZE(s->mac_name), mac_label());
+    s->latency_ms = -1;
+    s->autostart = g_pref_autostart;
+    s->clipboard = g_pref_clipboard;
+    s->autoupdate = g_pref_autoupdate;
+    s->discovery_available = g_disc_available;
+    s->searching = g_pair.discovery;
 
-/* Everything in Settings that changes on its own: the Mac and the update
- * state. (The check boxes change only here.) */
-static void settings_refresh(void)
-{
-    HWND dlg = g_settings;
-    wchar_t text[KB_NAME_MAX + 96], ver[KB_UPD_VERSION_MAX + 1];
-    BOOL checking;
-
-    if (dlg == NULL)
-        return;
-
-    SetDlgItemTextW(dlg, IDC_SET_MAC_NAME, g_paired ? mac_label() : L"No Mac paired");
-    settings_status_text(text, ARRAYSIZE(text));
-    SetDlgItemTextW(dlg, IDC_SET_MAC_STATUS, text);
-    InvalidateRect(GetDlgItem(dlg, IDC_SET_MAC_DOT), NULL, TRUE); /* its color */
-    SetDlgItemTextW(dlg, IDC_SET_PAIR, g_paired ? L"&Pair with a Different Mac\x2026" : L"&Pair with a Mac\x2026");
-    settings_enable(dlg, IDC_SET_FORGET, g_paired);
-
-    checking = g_upd_check != NULL && g_upd_check_manual;
-    if (checking) {
-        (void)StringCchCopyW(text, ARRAYSIZE(text), L"Checking for updates\x2026");
-    } else if (g_upd_pending != NULL) {
-        version_w(g_upd_pending->version, ver, ARRAYSIZE(ver));
-        (void)StringCchPrintfW(text, ARRAYSIZE(text), L"KeyBridge %ls is available (you have %ls)",
-                               ver, KB_VERSION_W);
-    } else {
-        (void)StringCchCopyW(text, ARRAYSIZE(text), L"Version " KB_VERSION_W);
+    /* The Macs, sorted by name. */
+    for (i = 0; i < KB_MAX_MACS; i++) {
+        if (!g_pair.macs[i].used)
+            continue;
+        for (k = n; k > 0 && CompareStringEx(LOCALE_NAME_USER_DEFAULT, NORM_IGNORECASE,
+                                             g_pair.macs[order[k - 1]].label, -1, g_pair.macs[i].label, -1,
+                                             NULL, NULL, 0) == CSTR_GREATER_THAN;
+             k--)
+            order[k] = order[k - 1];
+        order[k] = i;
+        n++;
     }
-    SetDlgItemTextW(dlg, IDC_SET_VERSION, text);
-    SetDlgItemTextW(dlg, IDC_SET_CHECKNOW, g_upd_pending != NULL ? L"&Update\x2026" : L"Check &Now");
-    settings_enable(dlg, IDC_SET_CHECKNOW, !checking && !g_upd_ui);
+    for (i = 0; i < n && s->nmacs < FLY_MAX_MACS; i++) {
+        const mac_entry *e = &g_pair.macs[order[i]];
+        fly_mac *fm = &s->macs[s->nmacs++];
+        fm->id = order[i];
+        (void)StringCchCopyW(fm->name, ARRAYSIZE(fm->name), e->label);
+        if (e->resolved)
+            (void)StringCchCopyW(fm->detail, ARRAYSIZE(fm->detail), e->host);
+    }
+    s->search_empty = g_pair.empty && s->nmacs == 0;
+    s->pair = g_pair.state;
+    s->pair_mac_id = g_pair.target;
+    (void)StringCchCopyW(s->pair_name, ARRAYSIZE(s->pair_name),
+                         g_pair.name[0] != 0 ? g_pair.name : g_pair.target_label);
+    s->sas = g_pair.sas;
+
+    /* Updates. */
+    if (g_upd_installing)
+        s->upd = FLY_UPD_INSTALLING;
+    else if (g_upd_download != NULL)
+        s->upd = FLY_UPD_DOWNLOADING;
+    else if (g_upd_failed)
+        s->upd = FLY_UPD_FAILED;
+    else if (g_upd_check != NULL && g_upd_check_manual)
+        s->upd = FLY_UPD_CHECKING;
+    else if (g_upd_pending != NULL && g_upd_offer)
+        s->upd = FLY_UPD_AVAILABLE;
+    else
+        s->upd = FLY_UPD_NONE;
+    if (g_upd_pending != NULL)
+        version_w(g_upd_pending->version, s->upd_version, ARRAYSIZE(s->upd_version));
+    s->upd_installable = kb_upd_is_installed_copy();
+    s->upd_permille = g_upd_permille;
+    update_status_text(s->upd_status, ARRAYSIZE(s->upd_status));
+    (void)StringCchCopyW(s->upd_error, ARRAYSIZE(s->upd_error), g_upd_error);
+
+    /* A message, if any. */
+    if (g_notice_sev != FLY_SEV_NONE) {
+        s->notice_sev = g_notice_sev;
+        (void)StringCchCopyW(s->notice_title, ARRAYSIZE(s->notice_title), g_notice_title);
+        (void)StringCchCopyW(s->notice_text, ARRAYSIZE(s->notice_text), g_notice_text);
+    } else if (s->conn == FLY_CONN_NOT_PAIRED) {
+        s->notice_sev = FLY_SEV_CAUTION;
+        (void)StringCchCopyW(s->notice_title, ARRAYSIZE(s->notice_title), L"Pair again");
+        (void)StringCchCopyW(s->notice_text, ARRAYSIZE(s->notice_text),
+                             L"Your Mac no longer recognizes this PC.");
+    }
+    flyout_set_state(s);
 }
 
-static void settings_init(HWND dlg)
+/* A setting changed in the flyout: save it, or put it back and say so. */
+static void set_pref(fly_action a, BOOL on)
 {
-    g_settings = dlg;
-    set_dialog_icons(dlg);
-    ui_init(&g_ui_settings, dlg);
-    CheckDlgButton(dlg, IDC_SET_AUTOSTART, autostart_is_enabled() ? BST_CHECKED : BST_UNCHECKED);
-    CheckDlgButton(dlg, IDC_SET_CLIPBOARD, prefs_share_clipboard() ? BST_CHECKED : BST_UNCHECKED);
-    CheckDlgButton(dlg, IDC_SET_AUTOUPDATE, prefs_auto_update() ? BST_CHECKED : BST_UNCHECKED);
-    settings_refresh();
-}
-
-/* A check box was clicked: save it, or put it back and say so. */
-static void settings_toggle(HWND dlg, int id)
-{
-    BOOL on = IsDlgButtonChecked(dlg, id) == BST_CHECKED;
     BOOL ok;
     const wchar_t *detail;
 
-    switch (id) {
-    case IDC_SET_AUTOSTART:
+    switch (a) {
+    case FLY_ACT_SET_AUTOSTART:
         ok = autostart_set(on);
+        if (ok)
+            g_pref_autostart = on;
         detail = L"KeyBridge couldn\x2019t change \x201CStart with Windows\x201D.";
         break;
-    case IDC_SET_CLIPBOARD:
+    case FLY_ACT_SET_CLIPBOARD:
         /* clipboard.c reads the setting each time the clipboard changes. */
         ok = prefs_set_share_clipboard(on);
-        detail = L"KeyBridge couldn\x2019t change \x201CShare clipboard with your Mac\x201D.";
+        if (ok)
+            g_pref_clipboard = on;
+        detail = L"KeyBridge couldn\x2019t change \x201CShare clipboard\x201D.";
         break;
     default:
         ok = prefs_set_auto_update(on);
-        detail = L"KeyBridge couldn\x2019t change \x201C" L"Automatically check for updates\x201D.";
+        if (ok)
+            g_pref_autoupdate = on;
+        detail = L"KeyBridge couldn\x2019t change \x201C" L"Check for updates automatically\x201D.";
         break;
     }
-    if (!ok) {
-        CheckDlgButton(dlg, id, on ? BST_UNCHECKED : BST_CHECKED);
-        kb_notice(L"Couldn\x2019t change that setting", detail, TRUE);
-    }
+    if (!ok)
+        notice_set(FLY_SEV_CRITICAL, L"Couldn\x2019t change that setting", detail);
+    ui_sync();
 }
 
-static INT_PTR CALLBACK settings_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
+static void on_fly_action(void *ctx, fly_action a, int arg, const wchar_t *text)
 {
-    INT_PTR handled;
-
-    if (msg != WM_INITDIALOG && ui_dialog_message(&g_ui_settings, dlg, msg, wp, lp, &handled))
-        return handled;
-    switch (msg) {
-    case WM_INITDIALOG:
-        settings_init(dlg);
-        return TRUE; /* focus on the first check box */
-
-    case WM_COMMAND:
-        switch (LOWORD(wp)) {
-        case IDC_SET_AUTOSTART:
-        case IDC_SET_CLIPBOARD:
-        case IDC_SET_AUTOUPDATE:
-            if (HIWORD(wp) == BN_CLICKED)
-                settings_toggle(dlg, LOWORD(wp));
-            return TRUE;
-        case IDC_SET_CHECKNOW:
-            if (g_upd_pending != NULL)
-                update_offer(g_upd_pending);
-            else
-                update_check_start(TRUE);
-            return TRUE;
-        case IDC_SET_PAIR:
-            show_setup(FALSE);
-            return TRUE;
-        case IDC_SET_FORGET:
-            forget_mac();
-            return TRUE;
-        case IDOK:
-        case IDCANCEL:
-            if (g_settings_modal == 0)
-                DestroyWindow(dlg);
-            return TRUE;
-        default:
-            break;
+    UNREFERENCED_PARAMETER(ctx);
+    if (g_quitting)
+        return;
+    switch (a) {
+    case FLY_ACT_SHOWN:
+        /* Settings may have changed elsewhere (the installer, another copy). */
+        g_pref_autostart = autostart_is_enabled();
+        g_pref_clipboard = prefs_share_clipboard();
+        g_pref_autoupdate = prefs_auto_update();
+        ui_sync();
+        break;
+    case FLY_ACT_HIDDEN:
+        notice_clear();
+        g_upd_note[0] = 0;
+        if (g_upd_failed && g_upd_download == NULL)
+            g_upd_failed = FALSE;
+        ui_sync();
+        break;
+    case FLY_ACT_DISCOVERY:
+        if (arg != 0)
+            disc_begin();
+        else
+            disc_end();
+        ui_sync();
+        break;
+    case FLY_ACT_PAIR_MAC:
+        pair_with_index(arg);
+        break;
+    case FLY_ACT_PAIR_ADDRESS:
+        pair_with_address(text);
+        break;
+    case FLY_ACT_CANCEL_PAIR:
+        pair_abandon();
+        pair_failed(NULL);
+        break;
+    case FLY_ACT_CONFIRM:
+        if (g_pair.job != NULL && g_pair.state == FLY_PAIR_COMPARE) {
+            SetEvent(g_pair.job->confirm); /* the pairing thread sends PcConfirm */
+            g_pair.state = FLY_PAIR_WAIT_MAC;
+            ui_sync();
         }
         break;
-
-    case WM_CLOSE:
-        if (g_settings_modal == 0)
-            DestroyWindow(dlg);
-        return TRUE;
-
-    case WM_DESTROY:
-        if (g_settings == dlg)
-            g_settings = NULL;
-        ui_free(&g_ui_settings);
+    case FLY_ACT_SEARCH_AGAIN:
+        if (g_pair.waiting_entry < 0) {
+            disc_stop_now();
+            disc_begin();
+        }
+        ui_sync();
         break;
-
+    case FLY_ACT_RECONNECT:
+        if (g_paired)
+            (void)start_from_config(); /* restarts the worker now */
+        break;
+    case FLY_ACT_SET_AUTOSTART:
+    case FLY_ACT_SET_CLIPBOARD:
+    case FLY_ACT_SET_AUTOUPDATE:
+        set_pref(a, arg != 0);
+        break;
+    case FLY_ACT_CHECK_UPDATE:
+        update_check_start(TRUE);
+        break;
+    case FLY_ACT_INSTALL_UPDATE:
+        update_install();
+        break;
+    case FLY_ACT_SKIP_UPDATE:
+        if (g_upd_failed) {
+            g_upd_failed = FALSE; /* closing an error only dismisses it */
+        } else if (g_upd_pending != NULL) {
+            if (!prefs_set_skipped_version(g_upd_pending->version))
+                notice_set(FLY_SEV_CRITICAL, L"Couldn\x2019t save that setting", NULL);
+            pending_clear();
+        }
+        ui_sync();
+        break;
+    case FLY_ACT_CANCEL_UPDATE:
+        update_cancel();
+        break;
+    case FLY_ACT_WHATS_NEW:
+        if (g_upd_pending != NULL)
+            open_notes(g_upd_pending);
+        break;
+    case FLY_ACT_FORGET:
+        forget_mac();
+        break;
+    case FLY_ACT_NOTICE_CLOSED:
+        notice_clear();
+        ui_sync();
+        break;
+    case FLY_ACT_QUIT:
+        request_quit();
+        break;
     default:
         break;
     }
-    return FALSE;
 }
 
-/* Open Settings, or bring it (or the window in front of it) forward. */
-static void show_settings(void)
+static void open_flyout(fly_page page)
 {
-    HWND front;
-
-    if (g_quitting)
-        return;
-    if (g_settings == NULL) {
-        if (CreateDialogParamW(g_inst, MAKEINTRESOURCEW(IDD_SETTINGS), NULL, settings_proc, 0) == NULL ||
-            g_settings == NULL)
-            return;
-        ShowWindow(g_settings, SW_SHOWNORMAL);
-    } else if (IsIconic(g_settings)) {
-        ShowWindow(g_settings, SW_RESTORE);
-    }
-    if (g_compare != NULL)
-        front = g_compare;
-    else if (g_setup != NULL)
-        front = g_setup;
-    else
-        front = GetLastActivePopup(g_settings); /* a question it owns, or itself */
-    SetForegroundWindow(front != NULL ? front : g_settings);
+    POINT anchor;
+    anchor.x = -1;
+    anchor.y = -1;
+    if (g_fly_ok && !g_quitting)
+        (void)flyout_show(anchor, page, FLY_SHOW_PROGRAMMATIC);
 }
 
 /* ------------------------------------------------------------------------ */
-/* Tray menu                                                                */
+/* Tray menu (right click)                                                  */
 /* ------------------------------------------------------------------------ */
-
-/* Menu text treats '&' as a mnemonic marker; a Mac name may contain one. */
-static void menu_escape(const wchar_t *in, wchar_t *out, size_t cap)
-{
-    size_t o = 0;
-    if (cap == 0)
-        return;
-    for (; *in != 0 && o + 2 < cap; in++) {
-        if (*in == L'&')
-            out[o++] = L'&';
-        out[o++] = *in;
-    }
-    out[o] = 0;
-}
-
-/* The bold first line (and a double-click on the icon): Setup while there
- * is nothing to connect to, Settings otherwise. */
-static void open_main_window(void)
-{
-    if (!g_paired || g_status == KB_ST_NOT_PAIRED)
-        show_setup(FALSE);
-    else
-        show_settings();
-}
 
 static void show_menu(int x, int y)
 {
     HMENU menu = CreatePopupMenu();
-    wchar_t status[160], escaped[320];
-    wchar_t update[96], ver[KB_UPD_VERSION_MAX + 1];
     UINT flags, cmd;
 
     if (menu == NULL)
         return;
-    /* Status first, in bold (the default item); choosing it opens a window. */
-    status_text(status, ARRAYSIZE(status));
-    menu_escape(status, escaped, ARRAYSIZE(escaped));
-    AppendMenuW(menu, MF_STRING, IDM_STATUS, escaped);
-    SetMenuDefaultItem(menu, IDM_STATUS, FALSE);
+    AppendMenuW(menu, MF_STRING, IDM_OPEN, L"Open KeyBridge");
+    SetMenuDefaultItem(menu, IDM_OPEN, FALSE);
+    AppendMenuW(menu, MF_STRING, IDM_SETTINGS, L"Settings");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING, IDM_PAIR,
-                g_paired ? L"Pair with a Different Mac\x2026" : L"Pair with a Mac\x2026");
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    if (g_upd_pending != NULL) {
-        version_w(g_upd_pending->version, ver, ARRAYSIZE(ver));
-        (void)StringCchPrintfW(update, ARRAYSIZE(update), L"Update to KeyBridge %ls\x2026", ver);
-        AppendMenuW(menu, MF_STRING, IDM_INSTALL_UPDATE, update);
-    }
-    AppendMenuW(menu, MF_STRING, IDM_CHECK_UPDATES, L"Check for Updates\x2026");
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING, IDM_SETTINGS, L"Settings\x2026");
     AppendMenuW(menu, MF_STRING, IDM_QUIT, L"Quit KeyBridge");
 
     /* The foreground dance makes the menu close when the user clicks away. */
@@ -2004,21 +1506,11 @@ static void show_menu(int x, int y)
     DestroyMenu(menu);
 
     switch (cmd) {
-    case IDM_STATUS:
-        open_main_window();
-        break;
-    case IDM_PAIR:
-        show_setup(FALSE);
-        break;
-    case IDM_CHECK_UPDATES:
-        update_check_start(TRUE);
-        break;
-    case IDM_INSTALL_UPDATE:
-        if (g_upd_pending != NULL)
-            update_offer(g_upd_pending);
+    case IDM_OPEN:
+        open_flyout(FLY_PAGE_HOME);
         break;
     case IDM_SETTINGS:
-        show_settings();
+        open_flyout(FLY_PAGE_SETTINGS);
         break;
     case IDM_QUIT:
         request_quit();
@@ -2032,6 +1524,41 @@ static void show_menu(int x, int y)
 /* Hidden window                                                            */
 /* ------------------------------------------------------------------------ */
 
+static void app_shutdown(void)
+{
+    if (g_quitting)
+        return;
+    g_quitting = TRUE;
+    if (g_hwnd != NULL) {
+        KillTimer(g_hwnd, KB_TIMER_TRAY);
+        KillTimer(g_hwnd, KB_TIMER_RESOLVE);
+        KillTimer(g_hwnd, KB_TIMER_UPD_FIRST);
+        KillTimer(g_hwnd, KB_TIMER_UPD_POLL);
+        KillTimer(g_hwnd, KB_TIMER_DISC_EMPTY);
+        KillTimer(g_hwnd, KB_TIMER_PAIR_OK);
+        KillTimer(g_hwnd, KB_TIMER_UPD_PROGRESS);
+    }
+    if (g_fly_ok) {
+        flyout_shutdown();
+        g_fly_ok = FALSE;
+    }
+    if (g_pair.discovery) {
+        discovery_stop();
+        g_pair.discovery = FALSE;
+    }
+    pair_abandon();
+    if (g_upd_check != NULL) {
+        kb_upd_job_release(g_upd_check); /* cancels it */
+        g_upd_check = NULL;
+    }
+    if (g_upd_download != NULL) {
+        kb_upd_job_release(g_upd_download); /* cancels it; deletes the file */
+        g_upd_download = NULL;
+    }
+    worker_stop(3000); /* the worker releases every held key before exiting */
+    tray_remove();
+}
+
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     if (msg != 0 && msg == g_msg_taskbar_created) {
@@ -2043,43 +1570,54 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     if (msg != 0 && msg == g_msg_show_settings) {
         /* A second launch of KeyBridge.exe: Settings if it asked for them
-         * (wParam 1, --show-settings), otherwise Setup or Settings. */
-        if (!g_quitting) {
-            if (wp != 0)
-                show_settings();
-            else
-                open_main_window();
-        }
+         * (wParam 1, --show-settings), otherwise the home page. */
+        open_flyout(wp != 0 ? FLY_PAGE_SETTINGS : FLY_PAGE_HOME);
         return 0;
     }
 
     switch (msg) {
-    case WM_KB_TRAY:
+    case WM_KB_TRAY: {
+        POINT anchor;
+        anchor.x = KB_GET_X(wp);
+        anchor.y = KB_GET_Y(wp);
         switch (LOWORD(lp)) {
-        case WM_CONTEXTMENU:
-            show_menu(KB_GET_X(wp), KB_GET_Y(wp));
+        case NIN_SELECT:    /* left click (sent on button-up) */
+        case NIN_KEYSELECT: /* Space/Enter on the keyboard-focused icon */
+            if (g_quitting)
+                break;
+            /* Synchronously: the foreground permission from the click is still valid. */
+            if (!g_fly_ok ||
+                !flyout_toggle(anchor, LOWORD(lp) == NIN_KEYSELECT ? FLY_SHOW_KEYBOARD : 0u))
+                show_menu(anchor.x, anchor.y);
             break;
-        case WM_LBUTTONDBLCLK:
-        case NIN_KEYSELECT:
-            open_main_window();
+        case WM_CONTEXTMENU: /* right click, Shift+F10, the Menu key */
+            if (g_fly_ok)
+                flyout_hide();
+            show_menu(anchor.x, anchor.y);
             break;
         case NIN_BALLOONUSERCLICK:
-            if (g_balloon_update) {
-                g_balloon_update = FALSE;
-                if (g_upd_pending != NULL)
-                    update_offer(g_upd_pending);
-            } else if (g_paired && g_status == KB_ST_NOT_PAIRED) {
-                show_setup(FALSE);
-            }
+            g_balloon_update = FALSE;
+            open_flyout(FLY_PAGE_HOME);
             break;
         default:
             break;
         }
         return 0;
+    }
 
     case WM_KB_STATUS:
         if (wp == worker_generation() && !g_quitting)
             on_status((kb_status)lp);
+        return 0;
+
+    case WM_KB_PAIR:
+        if (!g_quitting)
+            on_pair_event(wp, lp);
+        return 0;
+
+    case WM_KB_DISC:
+        if (!g_quitting)
+            on_disc_events();
         return 0;
 
     case WM_KB_UPDATE:
@@ -2088,10 +1626,50 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_TIMER:
-        if (wp == KB_TIMER_TRAY && (g_quitting || tray_add()))
-            KillTimer(hwnd, KB_TIMER_TRAY);
-        else if ((wp == KB_TIMER_UPD_FIRST || wp == KB_TIMER_UPD_POLL) && !g_quitting)
+        if (g_quitting) {
+            KillTimer(hwnd, wp);
+            return 0;
+        }
+        switch (wp) {
+        case KB_TIMER_TRAY:
+            if (tray_add())
+                KillTimer(hwnd, KB_TIMER_TRAY);
+            break;
+        case KB_TIMER_UPD_FIRST:
+        case KB_TIMER_UPD_POLL:
             on_update_timer(wp);
+            break;
+        case KB_TIMER_RESOLVE:
+            KillTimer(hwnd, KB_TIMER_RESOLVE);
+            if (g_pair.waiting_entry >= 0)
+                pair_failed(L"KeyBridge couldn\x2019t look up that Mac. Try again, or enter its address "
+                            L"manually.");
+            break;
+        case KB_TIMER_DISC_EMPTY:
+            KillTimer(hwnd, KB_TIMER_DISC_EMPTY);
+            if (g_pair.discovery) {
+                int i;
+                BOOL any = FALSE;
+                for (i = 0; i < KB_MAX_MACS; i++)
+                    any = any || g_pair.macs[i].used;
+                g_pair.empty = !any;
+                ui_sync();
+            }
+            break;
+        case KB_TIMER_PAIR_OK:
+            KillTimer(hwnd, KB_TIMER_PAIR_OK);
+            if (g_pair.state == FLY_PAIR_SUCCESS) {
+                g_pair.state = FLY_PAIR_IDLE;
+                g_pair.name[0] = 0;
+                ui_sync();
+            }
+            break;
+        case KB_TIMER_UPD_PROGRESS:
+            update_progress();
+            break;
+        default:
+            break;
+        }
         return 0;
 
     case WM_QUERYENDSESSION:
@@ -2151,7 +1729,7 @@ static BOOL create_window(void)
     return TRUE;
 }
 
-/* Another KeyBridge is running: ask it to show a window, then exit. */
+/* Another KeyBridge is running: ask it to show its flyout, then exit. */
 static void notify_running_instance(BOOL settings)
 {
     int i;
@@ -2202,6 +1780,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
     g_inst = inst;
     (void)HeapSetInformation(NULL, HeapEnableTerminationOnCorruption, NULL, 0);
     (void)SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
+#ifdef KEYBRIDGE_UI_PREVIEW
+    {
+        int rc;
+        if (kb_preview_main(inst, &rc))
+            return rc;
+    }
+#endif
     g_msg_show_settings = RegisterWindowMessageW(KB_MSG_SHOW_SETTINGS);
     want_settings = has_option(KB_FLAG_SHOW_SETTINGS); /* KeyBridge.exe --show-settings */
 
@@ -2228,28 +1813,30 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
         MessageBoxW(NULL, L"KeyBridge couldn't start.", KB_APP_NAME, MB_OK | MB_ICONERROR);
         return 1;
     }
+    g_pair.waiting_entry = -1;
+    g_pair.target = -1;
+    g_disc_available = discovery_available();
+    g_pref_autostart = autostart_is_enabled();
+    g_pref_clipboard = prefs_share_clipboard();
+    g_pref_autoupdate = prefs_auto_update();
+    g_fly_ok = flyout_init(inst, g_hwnd, KB_TRAY_UID, on_fly_action, NULL, 0);
     (void)clipboard_init(inst); /* before any worker starts; failure only disables sharing */
     /* The icon goes up first, so the "Paired with ..." balloon has a home. */
     if (!tray_add())
         SetTimer(g_hwnd, KB_TIMER_TRAY, KB_TRAY_RETRY_MS, NULL);
     SetTimer(g_hwnd, KB_TIMER_UPD_FIRST, KB_UPD_FIRST_MS, NULL);
+    ui_sync();
 
     /* Not paired yet (first launch, a v1.1 config, or unreadable settings):
-     * show the pairing window. Cancel quits. With --show-settings, Settings
-     * opens instead (it offers pairing too) and KeyBridge keeps running. */
-    if (!start_from_config() && !want_settings) {
-        if (show_setup(TRUE) != IDOK || g_quitting) {
-            if (g_hwnd != NULL)
-                DestroyWindow(g_hwnd);
-            return 0;
-        }
-    }
+     * open the flyout on the pairing page. Closing it leaves KeyBridge in
+     * the notification area. With --show-settings, Settings opens instead. */
+    g_first_run = !start_from_config();
     if (want_settings)
-        show_settings();
+        open_flyout(FLY_PAGE_SETTINGS);
+    else if (g_first_run)
+        open_flyout(FLY_PAGE_HOME);
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
-        if (g_settings != NULL && IsDialogMessageW(g_settings, &msg))
-            continue; /* Tab, arrows, Enter and Esc in Settings */
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }

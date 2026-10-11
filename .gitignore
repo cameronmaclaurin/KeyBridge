@@ -11,3 +11,4 @@ windows/*.exe
 windows/*.obj
 windows/*.res
 *.zip
+screenshots/

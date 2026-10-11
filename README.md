@@ -57,7 +57,7 @@ The Mac app listens on TCP port 9876 and the Windows app connects to it. In **Lo
 | Launch at Login | Start with Windows |
 | A warning when macOS Secure Input blocks key capture | Reconnects automatically |
 | Shared clipboard: copy here, paste on the PC | Shared clipboard: copy here, paste on the Mac |
-| Settings window (KeyBridge menu → **Settings…**) | Settings window (tray menu → **Settings…**) |
+| Settings window (KeyBridge menu → **Settings…**) | A small panel that opens from the tray icon, with pairing, status and settings inside it |
 
 ## Install & set up
 
@@ -83,7 +83,7 @@ Pairing works like pairing a Bluetooth keyboard: there's no code to type. If you
 1. On the Mac, click the KeyBridge icon in the menu bar and choose **Pair a Windows PC…**. Keep this window open while you pair.
 2. On the PC, open the KeyBridge setup window, pick your Mac from the list and click **Pair**. If your Mac isn't listed, type the address shown in the Mac's Pairing window instead (such as `Your-Mac.local` or `192.168.1.20`).
 3. Both screens now show a 6-digit number, such as **482 913**. **Check that the two numbers are the same**, then click **Confirm** on the Mac and on the PC. If they're different, click **Cancel** ([why](#the-numbers-dont-match)).
-4. Optional: turn on **Start with Windows** in the tray menu → **Settings…**.
+4. Optional: click the KeyBridge tray icon, open Settings (the gear), and turn on **Start with Windows**.
 
 When the PC connects, the Windows tray icon turns from gray to color. That's it. Press <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>&#96;</kbd> on the Mac and start typing on the PC.
 
@@ -110,12 +110,12 @@ The KeyBridge menu on the Mac also shows the current mode, the connection status
 - **Text only**, up to about 1 MB per copy. Images, files and formatting aren't shared. Larger text stays on the computer where you copied it.
 - **Only new copies.** What's already on the clipboard when the PC connects isn't sent. Only what you copy while connected is shared.
 - **Password managers' copies aren't shared.** Apps that mark what they copy as confidential or temporary are skipped, and most password managers do this.
-- **Turn it off** on either computer: Mac **Settings… → Clipboard**, or on the PC, tray menu → **Settings…**, then untick **Share clipboard**. Turning it off on either side stops sharing in both directions.
+- **Turn it off** on either computer: Mac **Settings… → Clipboard**, or on the PC, click the tray icon and turn off **Share clipboard**. Turning it off on either side stops sharing in both directions.
 
 **Settings.** Both apps have a redesigned Settings window.
 
 - **Mac** (KeyBridge menu → **Settings…**): change the switch shortcut, swap <kbd>⌘</kbd> and <kbd>⌃</kbd> on Windows, share the clipboard, play a sound when switching, turn notifications off, launch at login, check for updates automatically, and see or forget the paired PC.
-- **Windows** (tray menu → **Settings…**): share the clipboard, start with Windows, and check for updates automatically. These options used to be ticks in the tray menu; they've moved to the Settings window.
+- **Windows** (click the tray icon → gear): share the clipboard, start with Windows, check for updates automatically, forget the Mac, and quit. Right-click the tray icon for a short menu.
 
 **Key mapping**
 
@@ -135,8 +135,8 @@ KeyBridge keeps itself up to date (from v1.4.0 on). Both apps check GitHub for a
 
 - **Mac:** click **Install Update**. The installer opens; click through it and enter your password. KeyBridge restarts on the new version.
 - **Windows:** click **Install Update**. It installs silently and restarts KeyBridge. The portable exe can't update itself, so it opens the download page instead.
-- **Check now:** **Check for Updates…** in the Mac menu or the Windows tray menu.
-- **Turn it off:** untick **Automatically check for updates** in Settings on the Mac or on the PC (tray menu → **Settings…**).
+- **Check now:** **Check for Updates…** in the Mac menu, or **Check now** in the Windows tray panel's settings.
+- **Turn it off:** turn off **Automatically check for updates** in Settings on the Mac, or in the tray panel's settings on the PC.
 
 Updates are signed. Each release publishes a small manifest signed with a key that only the release build has. The apps refuse any update whose signature, size or SHA-256 doesn't match, even if it came from GitHub. Details: [`docs/UPDATES.md`](docs/UPDATES.md).
 
