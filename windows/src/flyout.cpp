@@ -44,10 +44,10 @@
 #define HOST_CLASS L"KeyBridgeFlyoutField"
 
 #define PANEL_W    360.0f
-#define SH_L       16.0f /* shadow margins: window = panel inflated by these */
-#define SH_T       8.0f
-#define SH_R       16.0f
-#define SH_B       24.0f
+#define SH_L       24.0f /* shadow margins: window = panel inflated by these */
+#define SH_T       16.0f
+#define SH_R       24.0f
+#define SH_B       32.0f
 #define FOOTER_H   48.0f
 
 #define WM_FLY_RENDER (WM_APP + 40)
@@ -1010,8 +1010,16 @@ static void ring(float cx, float cy, float size)
     ph = (float)fmod(t / 2000.0, 1.0);
     tri = ph < 0.5f ? ph * 2.0f : (1.0f - ph) * 2.0f;
     e = tri * tri * (3.0f - 2.0f * tri);
-    sweep = (60.0f + 210.0f * e) * 0.017453293f;
+    sweep = (120.0f + 150.0f * e) * 0.017453293f;
     a0 = rot - 1.5707963f;
+    {
+        /* Faint full-circle track so a single frame never reads as a stray tick. */
+        D2D1_ELLIPSE el;
+        el.point = ptf(cx, cy);
+        el.radiusX = el.radiusY = r;
+        set_brush((g.P.accent & 0x00FFFFFFu) | 0x33000000u);
+        g.rt->DrawEllipse(&el, g.br, stroke, NULL);
+    }
     if (FAILED(g.d2d->CreatePathGeometry(&pg)) || pg == NULL)
         return;
     if (SUCCEEDED(pg->Open(&sink)) && sink != NULL) {
@@ -1493,8 +1501,10 @@ static float view_pair(void)
     (void)text(L"Macs on this network", F_STRONG, 16.0f, y, 240.0f, 20.0f, P->text1, A_LEAD);
     if (busy_row)
         (void)link_right(C_CANCEL_PAIR, 352.0f, y - 6.0f, L"Cancel");
-    else if (st->searching && st->nmacs > 0)
+    else if (st->searching && st->nmacs > 0) {
+        (void)text(L"Searching\x2026", F_CAPTION, 216.0f, y + 2.0f, 104.0f, 16.0f, P->text2, A_TRAIL);
         ring(336.0f, y + 10.0f, 16.0f);
+    }
     y += 28.0f;
 
     if (st->nmacs > 0) {
@@ -2169,7 +2179,7 @@ static void render(void)
             clip.right = (float)(g.work.right - g.win_x) / g.s - SH_L;
             clip.bottom = (float)(g.work.bottom - g.win_y) / g.s - SH_T;
             g.rt->PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
-            for (i = 0; i < 8; i++) {
+            for (i = 0; i < 12; i++) {
                 float d = 2.0f * (float)(i + 1);
                 D2D1_ROUNDED_RECT rr;
                 rr.rect = rectf(-d, 6.0f - d, PANEL_W + 2.0f * d, g.ph + 2.0f * d);

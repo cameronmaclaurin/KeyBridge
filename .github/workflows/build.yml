@@ -363,7 +363,16 @@ jobs:
             New-Item -Force -Path $k | Out-Null
             Set-ItemProperty -Path $k -Name AppsUseLightTheme -Value $light -Type DWord
             Set-ItemProperty -Path $k -Name SystemUsesLightTheme -Value $light -Type DWord
-            Start-Sleep -Seconds 2
+            # Tell Explorer (taskbar) and apps that the theme changed.
+            if (-not ('KbNative' -as [type])) {
+              Add-Type -Namespace '' -Name KbNative -MemberDefinition @'
+          [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+          public static extern System.IntPtr SendMessageTimeout(System.IntPtr hWnd, uint msg, System.UIntPtr wParam, string lParam, uint flags, uint timeout, out System.UIntPtr result);
+          '@
+            }
+            $r = [System.UIntPtr]::Zero
+            [void][KbNative]::SendMessageTimeout([System.IntPtr]0xffff, 0x001A, [System.UIntPtr]::Zero, "ImmersiveColorSet", 0x0002, 5000, [ref]$r)
+            Start-Sleep -Seconds 3
           }
           function Run($exe, $argList, $name) {
             $p = if ($argList.Count) { Start-Process $exe -ArgumentList $argList -PassThru } else { Start-Process $exe -PassThru }
