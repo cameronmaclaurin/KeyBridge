@@ -2559,7 +2559,6 @@ static BOOL cursor_on_icon(void)
     RECT                 r;
     POINT                p;
     memset(&nii, 0, sizeof(nii));
-    SetRectEmpty(&icon);
     nii.cbSize = sizeof(nii);
     nii.hWnd = g.owner;
     nii.uID = g.uid;
