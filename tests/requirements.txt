@@ -1,4 +1,4 @@
 cryptography==50.0.2
 # Discovery test only (tests/interop/test_windows_discovery.py)
-zeroconf==0.151.3
+zeroconf==0.151.5
 ifaddr==0.2.0
